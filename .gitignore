@@ -1,0 +1,5 @@
+build/
+dist/
+.DS_Store
+github账号信息.txt
+*.dmg
