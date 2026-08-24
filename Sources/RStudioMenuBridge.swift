@@ -16,39 +16,43 @@ enum RStudioToolsAction: String, CaseIterable {
         }
     }
 
-    var rstudioItemTitles: [String] {
+    /// Text to search in RStudio Command Palette (Cmd+Shift+P).
+    var commandPaletteQuery: String {
+        switch self {
+        case .browseAddins: return "Browse Addins"
+        case .modifyKeyboardShortcuts: return "Modify Keyboard Shortcuts"
+        case .editCodeSnippets: return "Edit Code Snippets"
+        case .globalOptions: return "Global Options"
+        }
+    }
+
+    /// Nested path under Tools for AppleScript fallback (Browse Addins lives under Addins).
+    var toolsMenuPath: [String] {
         switch self {
         case .browseAddins:
-            return [
-                "browse addins", "browse addins…", "browse addins...",
-                "浏览插件", "浏览插件…", "浏览 Addins",
-            ]
+            return ["Addins", "Browse Addins…"]
         case .modifyKeyboardShortcuts:
-            return [
-                "modify keyboard shortcuts", "modify keyboard shortcuts…", "modify keyboard shortcuts...",
-                "keyboard shortcuts", "keyboard shortcuts…",
-                "修改键盘快捷键", "修改键盘快捷键…", "键盘快捷键",
-            ]
+            return ["Modify Keyboard Shortcuts…"]
         case .editCodeSnippets:
-            return [
-                "edit code snippets", "edit code snippets…", "edit code snippets...",
-                "code snippets", "code snippets…",
-                "编辑代码片段", "编辑代码片段…", "代码片段",
-            ]
+            return ["Edit Code Snippets…"]
         case .globalOptions:
-            return [
-                "global options", "global options…", "global options...",
-                "options", "options…",
-                "全局选项", "全局选项…", "选项",
-                "settings", "settings…", "preferences", "preferences…",
-                "偏好设置", "偏好设置…", "设置", "设置…",
-            ]
+            return ["Global Options…"]
+        }
+    }
+
+    var rstudioItemTitles: [String] {
+        toolsMenuPath.flatMap { item in
+            let base = item
+                .replacingOccurrences(of: "…", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return [base.lowercased(), item.lowercased()]
         }
     }
 }
 
 enum RStudioMenuBridge {
     private static let toolsMenuTitles = ["tools", "工具"]
+    private static var appleScriptBusy = false
 
     static func performToolsAction(_ action: RStudioToolsAction) {
         let instances = RStudioWindowService.instancesFast()
@@ -63,65 +67,152 @@ enum RStudioMenuBridge {
         RStudioWindowService.activate(target)
         ActivityLogger.shared.log("hub.toolsAction action=\(action.hubMenuTitle) pid=\(target.pid)")
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            openToolsMenuThenItem(pid: target.pid, action: action)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+            runAction(action, pid: target.pid)
         }
     }
 
-    private static func openToolsMenuThenItem(pid: pid_t, action: RStudioToolsAction) {
-        guard AccessibilityPermission.isGranted else {
-            fallback(action: action)
-            return
-        }
-
-        guard let toolsMenu = findTopMenu(pid: pid, titles: toolsMenuTitles) else {
-            ActivityLogger.shared.log("hub.toolsAction toolsMenu=missing")
-            fallback(action: action)
-            return
-        }
-
-        // First try without opening (children sometimes already populated).
-        if pressMatchingItem(in: toolsMenu, titles: action.rstudioItemTitles, menuName: "Tools") {
-            return
-        }
-
-        AXUIElementPerformAction(toolsMenu, kAXPressAction as CFString)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-            if pressMatchingItem(in: toolsMenu, titles: action.rstudioItemTitles, menuName: "Tools") {
-                return
-            }
-            // Global Options may live under the RStudio app menu / ⌘,.
-            if action == .globalOptions,
-               performAppMenuAction(pid: pid, itemTitles: action.rstudioItemTitles) {
-                return
-            }
-            fallback(action: action)
-        }
-    }
-
-    private static func fallback(action: RStudioToolsAction) {
+    private static func runAction(_ action: RStudioToolsAction, pid: pid_t) {
         if action == .globalOptions {
             RStudioWindowService.postCommandCommaFallback()
-        } else {
-            ActivityLogger.shared.log("hub.toolsAction failed action=\(action.hubMenuTitle)")
-            NSSound.beep()
+            ActivityLogger.shared.log("hub.toolsAction path=cmdComma action=\(action.hubMenuTitle)")
+            return
         }
+
+        if openViaCommandPalette(action: action) {
+            ActivityLogger.shared.log("hub.toolsAction path=commandPalette action=\(action.hubMenuTitle)")
+            return
+        }
+
+        if openViaPromotedMenu(action: action, pid: pid) {
+            ActivityLogger.shared.log("hub.toolsAction path=promotedMenu action=\(action.hubMenuTitle)")
+            return
+        }
+
+        ActivityLogger.shared.log("hub.toolsAction failed action=\(action.hubMenuTitle)")
+        NSSound.beep()
+    }
+
+    /// Command palette works even when RStudio hides its menu bar (accessory policy).
+    private static func openViaCommandPalette(action: RStudioToolsAction) -> Bool {
+        let query = escapeAppleScript(action.commandPaletteQuery)
+        let script = """
+        tell application "RStudio" to activate
+        delay 0.25
+        tell application "System Events"
+            tell process "RStudio"
+                set frontmost to true
+                keystroke "p" using {command down, shift down}
+                delay 0.4
+                keystroke "\(query)"
+                delay 0.2
+                key code 36
+            end tell
+        end tell
+        """
+        return runAppleScript(script)
+    }
+
+    /// Temporarily show RStudio in Dock so the menu bar exists, then click Tools items.
+    private static func openViaPromotedMenu(action: RStudioToolsAction, pid: pid_t) -> Bool {
+        ProcessTransform.showInDock(pid: pid)
+        DockPolicyService.promoteTargetForFocus(pid: pid)
+        NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps])
+
+        let variants = menuPathVariants(for: action)
+        var ok = false
+        for path in variants {
+            let menuChain = buildMenuAppleScript(path: path)
+            let script = """
+            tell application "RStudio" to activate
+            delay 0.35
+            tell application "System Events"
+                tell process "RStudio"
+                    set frontmost to true
+                    \(menuChain)
+                end tell
+            end tell
+            """
+            if runAppleScript(script) {
+                ok = true
+                break
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            DockPolicyService.restoreTargetHiddenFromDock(pid: pid)
+        }
+        return ok
+    }
+
+    private static func menuPathVariants(for action: RStudioToolsAction) -> [[String]] {
+        switch action {
+        case .browseAddins:
+            return [
+                ["Addins", "Browse Addins…"],
+                ["Addins", "Browse Addins..."],
+                ["Addins", "Browse Addins"],
+            ]
+        case .modifyKeyboardShortcuts:
+            return [
+                ["Modify Keyboard Shortcuts…"],
+                ["Modify Keyboard Shortcuts..."],
+                ["Modify Keyboard Shortcuts"],
+            ]
+        case .editCodeSnippets:
+            return [
+                ["Edit Code Snippets…"],
+                ["Edit Code Snippets..."],
+                ["Edit Code Snippets"],
+            ]
+        case .globalOptions:
+            return [
+                ["Global Options…"],
+                ["Global Options..."],
+                ["Global Options"],
+            ]
+        }
+    }
+
+    private static func buildMenuAppleScript(path: [String]) -> String {
+        guard !path.isEmpty else { return "" }
+        if path.count == 1 {
+            let leaf = escapeAppleScript(path[0])
+            return "click menu item \"\(leaf)\" of menu \"Tools\" of menu bar item \"Tools\" of menu bar 1"
+        }
+
+        var chain = "menu \"Tools\" of menu bar item \"Tools\" of menu bar 1"
+        for index in 0..<(path.count - 1) {
+            let name = escapeAppleScript(path[index])
+            chain = "menu \"\(name)\" of menu item \"\(name)\" of \(chain)"
+        }
+        let leaf = escapeAppleScript(path[path.count - 1])
+        let parent = escapeAppleScript(path[path.count - 2])
+        return "click menu item \"\(leaf)\" of menu \"\(parent)\" of menu item \"\(escapeAppleScript(path[0]))\" of menu \"Tools\" of menu bar item \"Tools\" of menu bar 1"
     }
 
     @discardableResult
-    private static func pressMatchingItem(in menu: AXUIElement, titles: [String], menuName: String) -> Bool {
-        let normalizedItems = Set(titles.map(normalizeTitle))
-        for item in menuItemCandidates(from: menu) {
-            guard let title = axString(item, kAXTitleAttribute as CFString) else { continue }
-            if normalizedItems.contains(normalizeTitle(title)) {
-                let err = AXUIElementPerformAction(item, kAXPressAction as CFString)
-                ActivityLogger.shared.log("hub.menuAction menu=\(menuName) item=\(title) err=\(err.rawValue)")
-                return err == .success
-            }
+    private static func runAppleScript(_ source: String) -> Bool {
+        guard !appleScriptBusy else { return false }
+        appleScriptBusy = true
+        defer { appleScriptBusy = false }
+
+        var error: NSDictionary?
+        let script = NSAppleScript(source: source)
+        script?.executeAndReturnError(&error)
+        if let error {
+            ActivityLogger.shared.log("hub.appleScript failed error=\(error)")
+            return false
         }
-        return false
+        return true
     }
 
+    private static func escapeAppleScript(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    // Legacy AX helpers kept for diagnostics; menu bar is usually unavailable under accessory policy.
     private static func findTopMenu(pid: pid_t, titles: [String]) -> AXUIElement? {
         let normalizedTop = Set(titles.map(normalizeTitle))
         let appElement = AXUIElementCreateApplication(pid)
@@ -141,53 +232,6 @@ enum RStudioMenuBridge {
             guard let title = axString(menu, kAXTitleAttribute as CFString) else { return false }
             return normalizedTop.contains(normalizeTitle(title))
         })
-    }
-
-    @discardableResult
-    static func performAppMenuAction(pid: pid_t, itemTitles: [String]) -> Bool {
-        guard AccessibilityPermission.isGranted else { return false }
-
-        let normalizedItems = Set(itemTitles.map(normalizeTitle))
-        let appElement = AXUIElementCreateApplication(pid)
-        var menuBarRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXMenuBarAttribute as CFString, &menuBarRef) == .success,
-              let menuBar = menuBarRef else {
-            return false
-        }
-
-        var menusRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(menuBar as! AXUIElement, kAXChildrenAttribute as CFString, &menusRef) == .success,
-              let menus = menusRef as? [AXUIElement] else {
-            return false
-        }
-
-        let appMenu = menus.dropFirst().first(where: { menu in
-            let title = axString(menu, kAXTitleAttribute as CFString)?.lowercased() ?? ""
-            return title.contains("rstudio")
-        }) ?? menus.dropFirst().first
-
-        guard let appMenu else { return false }
-        if pressMatchingItem(in: appMenu, titles: itemTitles, menuName: "RStudio") {
-            return true
-        }
-        AXUIElementPerformAction(appMenu, kAXPressAction as CFString)
-        return false
-    }
-
-    private static func menuItemCandidates(from menu: AXUIElement) -> [AXUIElement] {
-        var itemsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(menu, kAXChildrenAttribute as CFString, &itemsRef) == .success,
-              let topItems = itemsRef as? [AXUIElement] else {
-            return []
-        }
-        if topItems.count == 1 {
-            var nestedRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(topItems[0], kAXChildrenAttribute as CFString, &nestedRef) == .success,
-               let nested = nestedRef as? [AXUIElement], !nested.isEmpty {
-                return nested
-            }
-        }
-        return topItems
     }
 
     private static func normalizeTitle(_ title: String) -> String {
