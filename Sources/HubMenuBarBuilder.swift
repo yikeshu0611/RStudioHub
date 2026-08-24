@@ -9,6 +9,13 @@ enum HubMenuBarBuilder {
         let appMenu = NSMenu(title: "RStudioHub")
         appMenuItem.submenu = appMenu
         appMenu.addItem(withTitle: "关于 RStudioHub", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let updateItem = NSMenuItem(
+            title: HubUpdateService.menuTitle(),
+            action: #selector(RStudioHubApp.dockCheckForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        updateItem.target = app
+        appMenu.addItem(updateItem)
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 RStudioHub", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 

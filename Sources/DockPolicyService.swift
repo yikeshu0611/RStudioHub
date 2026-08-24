@@ -119,6 +119,36 @@ enum DockPolicyService {
 
     @discardableResult
     static func launchProjectHiddenFromDock(at path: String) -> Bool {
+        return openProjectInNewWindow(at: path)
+    }
+
+    /// Replace the current RStudio session: quit focused instance, then open the project.
+    @discardableResult
+    static func openProjectInCurrentWindow(at path: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: path) else {
+            ActivityLogger.shared.log("open.project.replace missing path=\(path)")
+            return false
+        }
+
+        let instances = RStudioWindowService.instancesFast()
+        if let pid = RStudioWindowService.preferredPID(for: instances) {
+            ActivityLogger.shared.log("open.project.replace quitCurrent pid=\(pid) path=\(path)")
+            RStudioDiscovery.quit(pid: pid)
+            RStudioWindowService.removeCachedInstance(pid: pid)
+            DockPolicyService.noteProcessTerminated(pid: pid)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                _ = openProjectInNewWindow(at: path)
+            }
+            return true
+        }
+
+        ActivityLogger.shared.log("open.project.replace noInstance path=\(path)")
+        return openProjectInNewWindow(at: path)
+    }
+
+    /// Open project in a brand-new RStudio instance (hidden from Dock).
+    @discardableResult
+    static func openProjectInNewWindow(at path: String) -> Bool {
         guard FileManager.default.fileExists(atPath: path) else {
             ActivityLogger.shared.log("launch.project missing path=\(path)")
             return false

@@ -4,6 +4,7 @@ enum HubDockMenuBuilder {
     /// Dock menus pad the right edge; the ✕ sits left of that padding.
     private static let closeZoneWidth: CGFloat = 72
     private static let titleTrailingPadding: CGFloat = 28
+    private static let newWindowMark = "↗"
 
     static func makeItems(instances: [RStudioInstance], app: RStudioHubApp) -> [NSMenuItem] {
         var items: [NSMenuItem] = []
@@ -19,16 +20,12 @@ enum HubDockMenuBuilder {
             items.append(.separator())
         }
 
-        items.append(makeToolsSubmenu(app: app))
-        items.append(.separator())
         items.append(contentsOf: makeInstanceItems(instances: instances, app: app))
         items.append(.separator())
         items.append(contentsOf: makeActionItems(instances: instances, app: app))
         items.append(.separator())
         items.append(makeFileSubmenu(app: app))
         items.append(makeProjectSubmenu(app: app))
-        items.append(makeUpdateItem(app: app))
-        items.append(makeOpenSettingsItem(app: app))
 
         return items
     }
@@ -73,17 +70,158 @@ enum HubDockMenuBuilder {
         return min(max(maxTextWidth + closeZoneWidth + 8, MenuLayout.minWidth), MenuLayout.maxWidth)
     }
 
-    private static func rowTitle(marker: String, title: String, contentWidth: CGFloat, font: NSFont) -> String {
+    private static func rowTitle(
+        marker: String,
+        title: String,
+        contentWidth: CGFloat,
+        font: NSFont,
+        trailingMark: String = "✕"
+    ) -> String {
         let base = "\(marker)\(title)"
         let baseWidth = (base as NSString).size(withAttributes: [.font: font]).width
-        let closeMark = "✕"
-        let closeWidth = (closeMark as NSString).size(withAttributes: [.font: font]).width
-        // Leave room on the right so ✕ aligns with the clickable close zone (not flush to menu edge).
+        let markWidth = (trailingMark as NSString).size(withAttributes: [.font: font]).width
         let usableWidth = contentWidth - titleTrailingPadding
-        let gap = usableWidth - baseWidth - closeWidth
+        let gap = usableWidth - baseWidth - markWidth
         let spaceWidth = max((" " as NSString).size(withAttributes: [.font: font]).width, 1)
         let spaces = max(2, Int(gap / spaceWidth))
-        return base + String(repeating: " ", count: spaces) + closeMark
+        return base + String(repeating: " ", count: spaces) + trailingMark
+    }
+
+    private static let menuItemHeight: CGFloat = 24
+    private static let menuVerticalPadding: CGFloat = 12
+    private static let submenuHeightTolerance: CGFloat = 24
+
+    private(set) static var dockFilePaths: [String] = []
+    private(set) static var dockProjectPaths: [String] = []
+    private(set) static var dockToolsItemCount: Int = RStudioToolsAction.allCases.count
+
+    /// Dock menus do not call `menuWillHighlight`; resolve hovered file path from submenu geometry.
+    static func filePathAtMouse(_ mouse: NSPoint = NSEvent.mouseLocation) -> String? {
+        filePathAtMouseViaSubmenuKind(mouse) ?? {
+            guard !dockFilePaths.isEmpty else { return nil }
+            guard let rect = dockSubmenuWindow(at: mouse, itemCount: dockFilePaths.count) else { return nil }
+            let index = rowIndex(in: rect, mouse: mouse)
+            guard index >= 0, index < dockFilePaths.count else { return nil }
+            return dockFilePaths[index]
+        }()
+    }
+
+    private enum DockSubmenuKind {
+        case files
+        case projects
+        case tools
+    }
+
+    private static func expectedSubmenuHeight(itemCount: Int) -> CGFloat {
+        CGFloat(itemCount) * menuItemHeight + menuVerticalPadding
+    }
+
+    private static func isMenuPopupWindow(_ info: [String: Any]) -> Bool {
+        if let layer = info[kCGWindowLayer as String] as? Int, layer >= 20 {
+            return true
+        }
+        if let owner = info[kCGWindowOwnerName as String] as? String {
+            return owner == "Dock" || owner == "Window Server"
+        }
+        return false
+    }
+
+    private static func dockSubmenuWindow(at mouse: NSPoint, itemCount: Int) -> CGRect? {
+        guard itemCount > 0 else { return nil }
+        let expectedHeight = expectedSubmenuHeight(itemCount: itemCount)
+        let cgMouse = quartzPoint(from: mouse)
+
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+
+        for info in windowList {
+            guard let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = bounds["X"],
+                  let y = bounds["Y"],
+                  let width = bounds["Width"],
+                  let height = bounds["Height"] else {
+                continue
+            }
+
+            let rect = CGRect(x: x, y: y, width: width, height: height)
+            guard rect.contains(cgMouse) else { continue }
+            guard isMenuPopupWindow(info) else { continue }
+            guard width >= 120, width <= 700 else { continue }
+            guard abs(height - expectedHeight) <= submenuHeightTolerance else { continue }
+            return rect
+        }
+
+        return nil
+    }
+
+    private static func rowIndex(in window: CGRect, mouse: NSPoint) -> Int {
+        let cgMouse = quartzPoint(from: mouse)
+        let localY = cgMouse.y - window.minY
+        return Int((localY - menuVerticalPadding / 2) / menuItemHeight)
+    }
+
+    private static func identifySubmenuKind(windowHeight: CGFloat) -> DockSubmenuKind? {
+        let tolerance = submenuHeightTolerance
+        var matches: [DockSubmenuKind] = []
+
+        if !dockFilePaths.isEmpty,
+           abs(windowHeight - expectedSubmenuHeight(itemCount: dockFilePaths.count)) <= tolerance {
+            matches.append(.files)
+        }
+        if !dockProjectPaths.isEmpty,
+           abs(windowHeight - expectedSubmenuHeight(itemCount: dockProjectPaths.count)) <= tolerance {
+            matches.append(.projects)
+        }
+        if dockToolsItemCount > 0,
+           abs(windowHeight - expectedSubmenuHeight(itemCount: dockToolsItemCount)) <= tolerance {
+            matches.append(.tools)
+        }
+
+        if matches.count == 1 {
+            return matches[0]
+        }
+        return nil
+    }
+
+    private static func filePathAtMouseViaSubmenuKind(_ mouse: NSPoint = NSEvent.mouseLocation) -> String? {
+        let cgMouse = quartzPoint(from: mouse)
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+
+        for info in windowList {
+            guard let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = bounds["X"],
+                  let y = bounds["Y"],
+                  let width = bounds["Width"],
+                  let height = bounds["Height"] else {
+                continue
+            }
+
+            let rect = CGRect(x: x, y: y, width: width, height: height)
+            guard rect.contains(cgMouse) else { continue }
+            guard isMenuPopupWindow(info) else { continue }
+            guard width >= 120, width <= 700, height >= 28, height < 900 else { continue }
+            guard identifySubmenuKind(windowHeight: height) == .files else { continue }
+
+            let index = rowIndex(in: rect, mouse: mouse)
+            guard index >= 0, index < dockFilePaths.count else { return nil }
+            return dockFilePaths[index]
+        }
+
+        return nil
+    }
+
+    /// Right-side action zone (close ✕ or new-window ↗).
+    static func isRightZoneClick(event: NSEvent?) -> Bool {
+        isCloseClick(event: event)
     }
 
     /// Detect close by mouse X against the actual menu window (Dock menus are not in NSApp.windows).
@@ -150,32 +288,26 @@ enum HubDockMenuBuilder {
         return CGPoint(x: cocoaPoint.x, y: topY - cocoaPoint.y)
     }
 
-    private static func makeToolsSubmenu(app: RStudioHubApp) -> NSMenuItem {
-        let submenu = NSMenu()
-        for action in RStudioToolsAction.allCases {
-            let item = NSMenuItem(
-                title: action.hubMenuTitle,
-                action: #selector(RStudioHubApp.dockToolsMenuAction(_:)),
-                keyEquivalent: ""
-            )
-            item.target = app
-            item.representedObject = action.rawValue
-            submenu.addItem(item)
-        }
-        let root = NSMenuItem(title: "Tools", action: nil, keyEquivalent: "")
-        root.submenu = submenu
-        return root
-    }
-
     private static func makeFileSubmenu(app: RStudioHubApp) -> NSMenuItem {
         let submenu = NSMenu()
+        submenu.delegate = app
         let files = RStudioRecentFiles.allEntries()
+        dockFilePaths = files.map(\.path)
 
         if files.isEmpty {
+            dockFilePaths = []
             let emptyItem = NSMenuItem(title: "没有历史文件", action: nil, keyEquivalent: "")
             emptyItem.isEnabled = false
             submenu.addItem(emptyItem)
         } else {
+            let font = NSFont.menuFont(ofSize: NSFont.systemFontSize)
+            var maxWidth: CGFloat = MenuLayout.minWidth
+            for entry in files {
+                let width = (entry.name as NSString).size(withAttributes: [.font: font]).width
+                maxWidth = max(maxWidth, width + 36)
+            }
+            let menuWidth = min(max(maxWidth, MenuLayout.minWidth), MenuLayout.maxWidth)
+
             for entry in files {
                 let item = NSMenuItem(
                     title: entry.name,
@@ -184,6 +316,8 @@ enum HubDockMenuBuilder {
                 )
                 item.target = app
                 item.representedObject = entry.path
+                item.toolTip = entry.path
+                item.view = DockFileMenuRowView(name: entry.name, path: entry.path, width: menuWidth)
                 submenu.addItem(item)
             }
         }
@@ -196,20 +330,25 @@ enum HubDockMenuBuilder {
     private static func makeProjectSubmenu(app: RStudioHubApp) -> NSMenuItem {
         let submenu = NSMenu()
         let projects = ProjectHistoryStore.shared.allEntries()
+        dockProjectPaths = projects.compactMap(\.path)
 
         if projects.isEmpty {
+            dockProjectPaths = []
             let emptyItem = NSMenuItem(title: "没有历史项目", action: nil, keyEquivalent: "")
             emptyItem.isEnabled = false
             submenu.addItem(emptyItem)
         } else {
+            let font = NSFont.menuFont(ofSize: NSFont.systemFontSize)
+            let contentWidth = dockProjectContentWidth(for: projects, font: font)
             for entry in projects {
                 let item = NSMenuItem(
-                    title: entry.name,
-                    action: #selector(RStudioHubApp.dockOpenProject(_:)),
+                    title: projectRowTitle(name: entry.name, contentWidth: contentWidth, font: font),
+                    action: #selector(RStudioHubApp.dockProjectRowAction(_:)),
                     keyEquivalent: ""
                 )
                 item.target = app
-                item.representedObject = entry.path
+                item.representedObject = DockProjectRowRef(path: entry.path ?? entry.name)
+                item.toolTip = "点击名称：关闭当前 RStudio 后打开；点击右侧 ↗：新窗口打开"
                 submenu.addItem(item)
             }
         }
@@ -219,24 +358,17 @@ enum HubDockMenuBuilder {
         return root
     }
 
-    private static func makeUpdateItem(app: RStudioHubApp) -> NSMenuItem {
-        let item = NSMenuItem(
-            title: HubUpdateService.menuTitle(),
-            action: #selector(RStudioHubApp.dockCheckForUpdates(_:)),
-            keyEquivalent: ""
-        )
-        item.target = app
-        return item
+    private static func dockProjectContentWidth(for projects: [ProjectHistoryEntry], font: NSFont) -> CGFloat {
+        var maxTextWidth: CGFloat = 120
+        for entry in projects {
+            let width = (entry.name as NSString).size(withAttributes: [.font: font]).width
+            maxTextWidth = max(maxTextWidth, width)
+        }
+        return min(max(maxTextWidth + closeZoneWidth + 8, MenuLayout.minWidth), MenuLayout.maxWidth)
     }
 
-    private static func makeOpenSettingsItem(app: RStudioHubApp) -> NSMenuItem {
-        let item = NSMenuItem(
-            title: "打开 RStudio 设置",
-            action: #selector(RStudioHubApp.dockOpenRStudioSettings(_:)),
-            keyEquivalent: ""
-        )
-        item.target = app
-        return item
+    private static func projectRowTitle(name: String, contentWidth: CGFloat, font: NSFont) -> String {
+        rowTitle(marker: "", title: name, contentWidth: contentWidth, font: font, trailingMark: newWindowMark)
     }
 
     private static func makeActionItems(instances: [RStudioInstance], app: RStudioHubApp) -> [NSMenuItem] {
@@ -271,5 +403,13 @@ final class DockInstanceRowRef: NSObject {
 
     init(pid: pid_t) {
         self.pid = pid
+    }
+}
+
+final class DockProjectRowRef: NSObject {
+    let path: String
+
+    init(path: String) {
+        self.path = path
     }
 }

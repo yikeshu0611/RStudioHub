@@ -45,7 +45,7 @@ enum MenuLayout {
 
     private static func projectTabContentWidth(projects: [ProjectHistoryEntry]) -> CGFloat {
         let font = NSFont.menuFont(ofSize: NSFont.systemFontSize)
-        let rowPadding: CGFloat = 18 + 10
+        let rowPadding: CGFloat = 18 + 10 + 22 + 8
 
         var width = textWidth("没有历史项目", font: font) + 36
         for entry in projects {

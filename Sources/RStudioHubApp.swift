@@ -13,8 +13,14 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let doublePressInterval: TimeInterval = 0.3
     private var selectedTab: HubMenuTab = .current
     private var isRecordingShortcut = false
-    private var dockCloseClickPending = false
+    private var dockRightZoneClickPending = false
     private var dockMouseMonitor: Any?
+    private var dockHoverMonitorLocal: Any?
+    private var dockHoverMonitorGlobal: Any?
+    private var dockHoverTimer: Timer?
+    private var dockMenuMonitorsActive = false
+    private var lastDockFileTooltipPath: String?
+    private var pendingDockLaunchFocus = false
 
     func showMenuAfterShortcutRecording() {
         showMenu()
@@ -60,6 +66,24 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             name: .hubLaunchAtLoginDidChange,
             object: nil
         )
+
+        pendingDockLaunchFocus = true
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if pendingDockLaunchFocus {
+            pendingDockLaunchFocus = false
+            DispatchQueue.main.async { [weak self] in
+                self?.focusRStudioFromDockClick()
+            }
+            return
+        }
+
+        if !menuIsOpen {
+            HubPathTooltip.hide()
+            lastDockFileTooltipPath = nil
+            stopDockHoverMonitoring()
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -118,37 +142,119 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) {
+        HubPathTooltip.hide()
+        lastDockFileTooltipPath = nil
+
+        if menu !== dockMenu {
+            return
+        }
+
         menuIsOpen = false
         if openMenu === menu {
             openMenu = nil
         }
-        if menu === dockMenu {
-            // Keep the last close-zone hit briefly; Dock sends the action after the menu closes.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                self?.stopDockCloseClickMonitor()
-            }
+
+        stopDockHoverMonitoring()
+        // Keep the last close-zone hit briefly; Dock sends the action after the menu closes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.stopDockClickMonitoring()
         }
+    }
+
+    func menuWillHighlight(_ item: NSMenuItem?) {
+        guard let item,
+              item.action == #selector(dockOpenFile(_:)),
+              let path = item.representedObject as? String else {
+            return
+        }
+        showDockFileTooltip(path)
     }
 
     private func startDockCloseClickMonitor() {
         stopDockCloseClickMonitor()
-        dockCloseClickPending = false
+        dockMenuMonitorsActive = true
+        dockRightZoneClickPending = false
+        lastDockFileTooltipPath = nil
         dockMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
             guard let self else { return }
-            let inCloseZone = HubDockMenuBuilder.isCloseClick(event: event)
+            let inRightZone = HubDockMenuBuilder.isRightZoneClick(event: event)
             if event.type == .leftMouseDown {
-                self.dockCloseClickPending = inCloseZone
-            } else if event.type == .leftMouseUp, inCloseZone {
-                self.dockCloseClickPending = true
+                self.dockRightZoneClickPending = inRightZone
+            } else if event.type == .leftMouseUp, inRightZone {
+                self.dockRightZoneClickPending = true
             }
+        }
+
+        startDockHoverMonitoring()
+    }
+
+    private func startDockHoverMonitoring() {
+        stopDockHoverMonitoring()
+
+        dockHoverMonitorLocal = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .mouseEntered, .mouseExited]) { [weak self] event in
+            self?.updateDockFileTooltip()
+            return event
+        }
+
+        dockHoverMonitorGlobal = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { [weak self] _ in
+            self?.updateDockFileTooltip()
+        }
+
+        dockHoverTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            self?.updateDockFileTooltip()
         }
     }
 
-    private func stopDockCloseClickMonitor() {
+    private func updateDockFileTooltip() {
+        guard dockMenuMonitorsActive, menuIsOpen else {
+            clearDockFileTooltip()
+            return
+        }
+
+        if let path = HubDockMenuBuilder.filePathAtMouse() {
+            showDockFileTooltip(path)
+        } else {
+            clearDockFileTooltip()
+        }
+    }
+
+    private func showDockFileTooltip(_ path: String) {
+        guard path != lastDockFileTooltipPath else { return }
+        lastDockFileTooltipPath = path
+        HubPathTooltip.show(path)
+    }
+
+    private func clearDockFileTooltip() {
+        guard lastDockFileTooltipPath != nil else { return }
+        lastDockFileTooltipPath = nil
+        HubPathTooltip.hide()
+    }
+
+    private func stopDockHoverMonitoring() {
+        if let dockHoverMonitorLocal {
+            NSEvent.removeMonitor(dockHoverMonitorLocal)
+            self.dockHoverMonitorLocal = nil
+        }
+        if let dockHoverMonitorGlobal {
+            NSEvent.removeMonitor(dockHoverMonitorGlobal)
+            self.dockHoverMonitorGlobal = nil
+        }
+        dockHoverTimer?.invalidate()
+        dockHoverTimer = nil
+        clearDockFileTooltip()
+    }
+
+    private func stopDockClickMonitoring() {
         if let dockMouseMonitor {
             NSEvent.removeMonitor(dockMouseMonitor)
             self.dockMouseMonitor = nil
         }
+        dockMenuMonitorsActive = false
+    }
+
+    private func stopDockCloseClickMonitor() {
+        stopDockHoverMonitoring()
+        stopDockClickMonitoring()
     }
 
     func beginShortcutRecording(reopenMenu: Bool) {
@@ -414,9 +520,15 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             for entry in projects {
                 let item = NSMenuItem()
-                item.view = ProjectMenuRowView(entry: entry) { [weak self] project in
-                    self?.openProject(project)
-                }
+                item.view = ProjectMenuRowView(
+                    entry: entry,
+                    onOpenCurrent: { [weak self] project in
+                        self?.openProjectInCurrentWindow(project)
+                    },
+                    onOpenNew: { [weak self] project in
+                        self?.openProjectInNewWindow(project)
+                    }
+                )
                 items.append(item)
             }
         }
@@ -440,8 +552,8 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let ref = sender.representedObject as? DockInstanceRowRef else { return }
         // Prefer the flag captured while the Dock menu was still open.
         // Avoid re-scanning CG windows here — that was adding noticeable lag.
-        let shouldClose = dockCloseClickPending
-        dockCloseClickPending = false
+        let shouldClose = dockRightZoneClickPending
+        dockRightZoneClickPending = false
 
         if shouldClose {
             ActivityLogger.shared.log("hub.dockClose pid=\(ref.pid)")
@@ -478,10 +590,6 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         HubUpdateService.checkForUpdates(interactive: true)
     }
 
-    @objc func dockOpenRStudioSettings(_ sender: NSMenuItem) {
-        RStudioMenuBridge.performToolsAction(.globalOptions)
-    }
-
     @objc func hubToolsMenuAction(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let action = RStudioToolsAction(rawValue: raw) else {
@@ -490,8 +598,23 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RStudioMenuBridge.performToolsAction(action)
     }
 
-    @objc func dockToolsMenuAction(_ sender: NSMenuItem) {
-        hubToolsMenuAction(sender)
+    @objc func dockProjectRowAction(_ sender: NSMenuItem) {
+        guard let ref = sender.representedObject as? DockProjectRowRef else { return }
+        let openNewWindow = dockRightZoneClickPending
+        dockRightZoneClickPending = false
+
+        let entry = ProjectHistoryStore.shared.allEntries().first { $0.path == ref.path }
+            ?? ProjectHistoryStore.shared.allEntries().first {
+                ProjectHistoryStore.shared.resolveOpenPath(for: $0) == ref.path
+            }
+            ?? ProjectHistoryStore.shared.allEntries().first { $0.name == ref.path }
+
+        guard let entry else { return }
+        if openNewWindow {
+            openProjectInNewWindow(entry)
+        } else {
+            openProjectInCurrentWindow(entry)
+        }
     }
 
     @objc func dockOpenProject(_ sender: NSMenuItem) {
@@ -501,7 +624,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ProjectHistoryStore.shared.resolveOpenPath(for: $0) == path
             }
         guard let entry else { return }
-        openProject(entry)
+        openProjectInCurrentWindow(entry)
     }
 
     @objc func dockCreateNewRproj() {
@@ -553,17 +676,32 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func openProject(_ entry: ProjectHistoryEntry) {
+    private func openProjectInCurrentWindow(_ entry: ProjectHistoryEntry) {
         guard let path = ProjectHistoryStore.shared.resolveOpenPath(for: entry) else {
-            ActivityLogger.shared.log("hub.openProject missingPath name=\(entry.name)")
+            ActivityLogger.shared.log("hub.openProject.current missingPath name=\(entry.name)")
             showLaunchError(message: "找不到项目文件：\(entry.name)\n请先在 RStudio 中打开过该项目。")
             return
         }
 
-        ActivityLogger.shared.log("hub.openProject name=\(entry.name) path=\(path)")
+        ActivityLogger.shared.log("hub.openProject.replace name=\(entry.name) path=\(path)")
         ProjectHistoryStore.shared.record(name: entry.name, path: path)
 
-        if !DockPolicyService.launchProjectHiddenFromDock(at: path) {
+        if !DockPolicyService.openProjectInCurrentWindow(at: path) {
+            showLaunchError(message: "无法打开项目：\(entry.name)")
+        }
+    }
+
+    private func openProjectInNewWindow(_ entry: ProjectHistoryEntry) {
+        guard let path = ProjectHistoryStore.shared.resolveOpenPath(for: entry) else {
+            ActivityLogger.shared.log("hub.openProject.new missingPath name=\(entry.name)")
+            showLaunchError(message: "找不到项目文件：\(entry.name)\n请先在 RStudio 中打开过该项目。")
+            return
+        }
+
+        ActivityLogger.shared.log("hub.openProject.new name=\(entry.name) path=\(path)")
+        ProjectHistoryStore.shared.record(name: entry.name, path: path)
+
+        if !DockPolicyService.openProjectInNewWindow(at: path) {
             showLaunchError(message: "无法打开项目：\(entry.name)")
         }
     }
@@ -590,39 +728,8 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func createAndOpenNewRproj() {
-        let panel = NSSavePanel()
-        panel.title = "新建 R 项目"
-        panel.prompt = "创建"
-        panel.nameFieldStringValue = "NewProject.Rproj"
-        panel.allowedFileTypes = ["Rproj"]
-        panel.canCreateDirectories = true
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        var projectURL = url
-        if projectURL.pathExtension.lowercased() != "rproj" {
-            projectURL = projectURL.appendingPathExtension("Rproj")
-        }
-
-        let projectBody = "Version: 1.0\n"
-        do {
-            try projectBody.write(to: projectURL, atomically: true, encoding: .utf8)
-        } catch {
-            showLaunchError(message: "无法创建项目文件：\(error.localizedDescription)")
-            return
-        }
-
-        let path = projectURL.path
-        let name = projectURL.deletingPathExtension().lastPathComponent
-        ProjectHistoryStore.shared.record(name: name, path: path)
-
-        if !DockPolicyService.launchProjectHiddenFromDock(at: path) {
-            showLaunchError(message: "无法打开新建的项目")
-            return
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.reloadMenuInstances()
+        if !RStudioMenuBridge.createNewProject() {
+            showLaunchError(message: "请确认 RStudio 已安装在 /Applications/RStudio.app")
         }
     }
 
