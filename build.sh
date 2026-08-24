@@ -55,6 +55,7 @@ SWIFT_SOURCES=(
   "$ROOT_DIR/Sources/LaunchAtLoginSettings.swift"
   "$ROOT_DIR/Sources/HubAppPolicy.swift"
   "$ROOT_DIR/Sources/HubNameSort.swift"
+  "$ROOT_DIR/Sources/HubKeyboard.swift"
   "$ROOT_DIR/Sources/HubUpdateService.swift"
   "$ROOT_DIR/Sources/HubMenuBarBuilder.swift"
   "$ROOT_DIR/Sources/RStudioMenuBridge.swift"

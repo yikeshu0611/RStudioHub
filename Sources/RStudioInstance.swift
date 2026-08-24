@@ -373,22 +373,7 @@ enum RStudioWindowService {
     }
 
     static func postCommandCommaFallback() {
-        postCommandComma()
-    }
-
-    private static func postCommandComma() {
-        let source = CGEventSource(stateID: .hidSystemState)
-        let keyCode: CGKeyCode = 0x2B // comma
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
-            ActivityLogger.shared.log("hub.openPreferences cmdComma=failed")
-            return
-        }
-        keyDown.flags = .maskCommand
-        keyUp.flags = .maskCommand
-        keyDown.post(tap: .cghidEventTap)
-        keyUp.post(tap: .cghidEventTap)
-        ActivityLogger.shared.log("hub.openPreferences cmdComma=posted")
+        HubKeyboard.postCommandComma()
     }
 
     private static func instanceForProcess(pid: pid_t, isActive: Bool) -> RStudioInstance {
