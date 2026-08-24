@@ -62,3 +62,4 @@ enum RStudioMenuBridge {
         ActivityLogger.shared.log("hub.toolsAction path=cgPalette query=\(query)")
         HubKeyboard.runCommandPalette(query: query)
     }
+}
