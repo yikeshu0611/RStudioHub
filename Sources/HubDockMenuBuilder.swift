@@ -26,6 +26,7 @@ enum HubDockMenuBuilder {
         items.append(makeFileSubmenu(app: app))
         items.append(makeProjectSubmenu(app: app))
         items.append(makeUpdateItem(app: app))
+        items.append(makeOpenSettingsItem(app: app))
 
         return items
     }
@@ -203,6 +204,16 @@ enum HubDockMenuBuilder {
         let item = NSMenuItem(
             title: HubUpdateService.menuTitle(),
             action: #selector(RStudioHubApp.dockCheckForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        item.target = app
+        return item
+    }
+
+    private static func makeOpenSettingsItem(app: RStudioHubApp) -> NSMenuItem {
+        let item = NSMenuItem(
+            title: "打开 RStudio 设置",
+            action: #selector(RStudioHubApp.dockOpenRStudioSettings(_:)),
             keyEquivalent: ""
         )
         item.target = app

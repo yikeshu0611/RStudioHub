@@ -357,6 +357,107 @@ enum RStudioWindowService {
         AXUIElementPerformAction(window, kAXRaiseAction as CFString)
     }
 
+    /// Open RStudio Preferences/Settings for the preferred running instance.
+    static func openPreferences() {
+        let instances = instancesFast()
+        guard !instances.isEmpty else {
+            NSSound.beep()
+            ActivityLogger.shared.log("hub.openPreferences noInstance")
+            return
+        }
+
+        let preferredPID = lastFocusedPID ?? RStudioDiscovery.activePID()
+        let target = instances.first(where: { $0.pid == preferredPID }) ?? instances[0]
+        activate(target)
+        ActivityLogger.shared.log("hub.openPreferences pid=\(target.pid)")
+
+        // Menu bar may be missing under accessory policy — prefer ⌘, after focus settles.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            if openPreferencesViaMenuBar(pid: target.pid) {
+                return
+            }
+            postCommandComma()
+        }
+    }
+
+    private static let preferencesMenuTitles: Set<String> = [
+        "settings…", "settings...", "settings",
+        "preferences…", "preferences...", "preferences",
+        "选项…", "选项...", "选项",
+        "偏好设置…", "偏好设置...", "偏好设置",
+        "设置…", "设置...", "设置",
+    ]
+
+    @discardableResult
+    private static func openPreferencesViaMenuBar(pid: pid_t) -> Bool {
+        guard AccessibilityPermission.isGranted else { return false }
+
+        let appElement = AXUIElementCreateApplication(pid)
+        var menuBarRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXMenuBarAttribute as CFString, &menuBarRef) == .success,
+              let menuBar = menuBarRef else {
+            return false
+        }
+
+        var menusRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(menuBar as! AXUIElement, kAXChildrenAttribute as CFString, &menusRef) == .success,
+              let menus = menusRef as? [AXUIElement] else {
+            return false
+        }
+
+        // Skip Apple menu (index 0); prefer the RStudio application menu.
+        let appMenu = menus.dropFirst().first(where: { menu in
+            let title = axString(menu, kAXTitleAttribute as CFString)?.lowercased() ?? ""
+            return title.contains("rstudio")
+        }) ?? menus.dropFirst().first
+
+        guard let appMenu else { return false }
+
+        // Prefer reading existing children without opening the menu UI.
+        let candidates = menuItemCandidates(from: appMenu)
+        for item in candidates {
+            guard let title = axString(item, kAXTitleAttribute as CFString) else { continue }
+            let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if preferencesMenuTitles.contains(normalized) {
+                let err = AXUIElementPerformAction(item, kAXPressAction as CFString)
+                ActivityLogger.shared.log("hub.openPreferences menu=\(title) err=\(err.rawValue)")
+                return err == .success
+            }
+        }
+        return false
+    }
+
+    private static func menuItemCandidates(from menu: AXUIElement) -> [AXUIElement] {
+        var itemsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(menu, kAXChildrenAttribute as CFString, &itemsRef) == .success,
+              let topItems = itemsRef as? [AXUIElement] else {
+            return []
+        }
+        if topItems.count == 1 {
+            var nestedRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(topItems[0], kAXChildrenAttribute as CFString, &nestedRef) == .success,
+               let nested = nestedRef as? [AXUIElement], !nested.isEmpty {
+                return nested
+            }
+        }
+        return topItems
+    }
+
+    private static func postCommandComma() {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let keyCode: CGKeyCode = 0x2B // comma
+        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
+            ActivityLogger.shared.log("hub.openPreferences cmdComma=failed")
+            return
+        }
+        keyDown.flags = .maskCommand
+        keyUp.flags = .maskCommand
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+        ActivityLogger.shared.log("hub.openPreferences cmdComma=posted")
+    }
+
     private static func instanceForProcess(pid: pid_t, isActive: Bool) -> RStudioInstance {
         var resolvedTitle = ""
 

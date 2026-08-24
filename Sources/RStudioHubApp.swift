@@ -477,6 +477,10 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         HubUpdateService.checkForUpdates(interactive: true)
     }
 
+    @objc func dockOpenRStudioSettings(_ sender: NSMenuItem) {
+        RStudioWindowService.openPreferences()
+    }
+
     @objc func dockOpenProject(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
         let entry = ProjectHistoryStore.shared.allEntries().first { $0.path == path }
