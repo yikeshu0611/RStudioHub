@@ -19,6 +19,8 @@ enum HubDockMenuBuilder {
             items.append(.separator())
         }
 
+        items.append(makeToolsSubmenu(app: app))
+        items.append(.separator())
         items.append(contentsOf: makeInstanceItems(instances: instances, app: app))
         items.append(.separator())
         items.append(contentsOf: makeActionItems(instances: instances, app: app))
@@ -146,6 +148,23 @@ enum HubDockMenuBuilder {
         }
         let topY = screen.frame.maxY
         return CGPoint(x: cocoaPoint.x, y: topY - cocoaPoint.y)
+    }
+
+    private static func makeToolsSubmenu(app: RStudioHubApp) -> NSMenuItem {
+        let submenu = NSMenu()
+        for action in RStudioToolsAction.allCases {
+            let item = NSMenuItem(
+                title: action.hubMenuTitle,
+                action: #selector(RStudioHubApp.dockToolsMenuAction(_:)),
+                keyEquivalent: ""
+            )
+            item.target = app
+            item.representedObject = action.rawValue
+            submenu.addItem(item)
+        }
+        let root = NSMenuItem(title: "Tools", action: nil, keyEquivalent: "")
+        root.submenu = submenu
+        return root
     }
 
     private static func makeFileSubmenu(app: RStudioHubApp) -> NSMenuItem {

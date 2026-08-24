@@ -56,6 +56,8 @@ SWIFT_SOURCES=(
   "$ROOT_DIR/Sources/HubAppPolicy.swift"
   "$ROOT_DIR/Sources/HubNameSort.swift"
   "$ROOT_DIR/Sources/HubUpdateService.swift"
+  "$ROOT_DIR/Sources/HubMenuBarBuilder.swift"
+  "$ROOT_DIR/Sources/RStudioMenuBridge.swift"
   "$ROOT_DIR/Sources/HubDockMenuBuilder.swift"
   "$ROOT_DIR/Sources/ProcessTransform.swift"
   "$ROOT_DIR/Sources/DockPolicyService.swift"

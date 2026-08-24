@@ -24,6 +24,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
         ActivityLogger.shared.log("hub.launch version=\(version) log=\(ActivityLogger.shared.currentLogURL.path)")
         HubAppPolicy.showInDock()
+        HubMenuBarBuilder.install(on: self)
         popupMenu.delegate = self
         dockMenu.delegate = self
         popupMenu.appearance = NSAppearance(named: .aqua)
@@ -478,7 +479,19 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func dockOpenRStudioSettings(_ sender: NSMenuItem) {
-        RStudioWindowService.openPreferences()
+        RStudioMenuBridge.performToolsAction(.globalOptions)
+    }
+
+    @objc func hubToolsMenuAction(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let action = RStudioToolsAction(rawValue: raw) else {
+            return
+        }
+        RStudioMenuBridge.performToolsAction(action)
+    }
+
+    @objc func dockToolsMenuAction(_ sender: NSMenuItem) {
+        hubToolsMenuAction(sender)
     }
 
     @objc func dockOpenProject(_ sender: NSMenuItem) {
