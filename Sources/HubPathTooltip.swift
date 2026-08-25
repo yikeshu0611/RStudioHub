@@ -67,10 +67,12 @@ enum HubPathTooltip {
             defer: false
         )
         tooltipPanel.isFloatingPanel = true
+        // Dock menus often show while Hub is not active — lifetime is menu open/close + idle tearDown.
         tooltipPanel.hidesOnDeactivate = false
         tooltipPanel.becomesKeyOnlyIfNeeded = true
+        // High enough to sit beside Dock menus; tearDown prevents orphans over other apps.
         tooltipPanel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.assistiveTechHighWindow)))
-        tooltipPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .transient]
+        tooltipPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         tooltipPanel.backgroundColor = .clear
         tooltipPanel.hasShadow = true
         tooltipPanel.isOpaque = false
@@ -113,12 +115,14 @@ enum HubPathTooltip {
 
     static func hide() {
         panel?.orderOut(nil)
-        // Keep panel instance for faster reuse while Dock menu is open.
         label?.stringValue = ""
     }
 
     static func tearDown() {
-        panel?.orderOut(nil)
+        if let panel {
+            panel.orderOut(nil)
+            panel.close()
+        }
         panel = nil
         label = nil
     }

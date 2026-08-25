@@ -178,7 +178,9 @@ enum HubDockMenuBuilder {
 
     private static let menuItemHeight: CGFloat = 24
     private static let menuVerticalPadding: CGFloat = 12
-    private static let submenuHeightTolerance: CGFloat = 64
+    /// Dock menu chrome varies by macOS version / scaling — keep relatively tight to avoid
+    /// mistaking the root Dock menu for the files submenu.
+    private static let submenuHeightTolerance: CGFloat = 40
 
     private(set) static var dockFilePaths: [String] = []
     private(set) static var dockProjectPaths: [String] = []
@@ -187,37 +189,92 @@ enum HubDockMenuBuilder {
     static weak var projectSubmenu: NSMenu?
     static var openDockSubmenuKind: DockSubmenuKind?
 
-    static func filePathAtMouse(_ mouse: NSPoint = NSEvent.mouseLocation) -> String? {
-        if let path = pathFromOpenFilesSubmenu(mouse) {
-            return path
-        }
-        return filePathAtMouseViaSubmenuKind(mouse) ?? {
-            guard !dockFilePaths.isEmpty else { return nil }
-            guard let rect = dockSubmenuWindow(at: mouse, itemCount: dockFilePaths.count) else { return nil }
-            let index = rowIndex(in: rect, mouse: mouse)
-            guard index >= 0, index < dockFilePaths.count else { return nil }
-            return dockFilePaths[index]
-        }()
+    /// Last known on-screen files-list frame (Quartz), kept briefly for stable hover/positioning.
+    private static var cachedFilesFrameQuartz: CGRect?
+    private static var cachedFilesFrameAt: TimeInterval = 0
+
+    static func resetFilesFrameCache() {
+        cachedFilesFrameQuartz = nil
+        cachedFilesFrameAt = 0
     }
 
-    /// Best-effort path for the file row currently under the cursor.
-    static func filePathForHover(mouse: NSPoint = NSEvent.mouseLocation) -> String? {
-        if let item = fileSubmenu?.highlightedItem,
-           let path = item.representedObject as? String {
-            return path
+    private static func rememberFilesFrame(_ rect: CGRect) {
+        cachedFilesFrameQuartz = rect
+        cachedFilesFrameAt = Date.timeIntervalSinceReferenceDate
+    }
+
+    private static func looksLikeFilesMenu(height: CGFloat, itemCount: Int) -> Bool {
+        guard itemCount > 0 else { return false }
+        let expected = expectedSubmenuHeight(itemCount: itemCount)
+        return abs(height - expected) <= submenuHeightTolerance
+    }
+
+    /// On-screen Dock/menu popup windows (Quartz bounds).
+    private static func onScreenMenuWindows() -> [CGRect] {
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return []
         }
+        var result: [CGRect] = []
+        for info in windowList {
+            guard let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = bounds["X"],
+                  let y = bounds["Y"],
+                  let width = bounds["Width"],
+                  let height = bounds["Height"] else {
+                continue
+            }
+            let rect = CGRect(x: x, y: y, width: width, height: height)
+            guard isMenuPopupWindow(info) else { continue }
+            guard width >= 80, width <= 1400, height >= 28, height < 900 else { continue }
+            result.append(rect)
+        }
+        return result
+    }
+
+    static func filePathAtMouse(_ mouse: NSPoint = NSEvent.mouseLocation) -> String? {
+        guard !dockFilePaths.isEmpty else { return nil }
+        guard let rect = filesListWindowContaining(mouse) else { return nil }
+        rememberFilesFrame(rect)
+        let index = rowIndex(in: rect, mouse: mouse, itemCount: dockFilePaths.count)
+        guard index >= 0, index < dockFilePaths.count else { return nil }
+        return dockFilePaths[index]
+    }
+
+    /// Path under the cursor — only when the cursor is inside the files list window.
+    static func filePathForHover(mouse: NSPoint = NSEvent.mouseLocation) -> String? {
+        guard isMouseInsideFilesSubmenu(mouse: mouse) else { return nil }
+
         if let path = filePathFromAccessibility(mouse: mouse) {
             return path
         }
         return filePathAtMouse(mouse)
     }
 
-    /// True when the cursor is inside the on-screen「历史文件」list.
+    /// True only when the history-files submenu is on-screen and the cursor is inside it.
     static func isMouseInsideFilesSubmenu(mouse: NSPoint = NSEvent.mouseLocation) -> Bool {
-        if openDockSubmenuKind == .files, fileSubmenu?.highlightedItem != nil {
-            return true
-        }
-        return filesSubmenuFrame(mouse: mouse).map { NSMouseInRect(mouse, $0, false) } ?? false
+        guard !dockFilePaths.isEmpty else { return false }
+        // Root Dock menu alone must never qualify — need parent + files submenu.
+        guard onScreenMenuWindows().count >= 2 else { return false }
+        guard let rect = filesListWindowContaining(mouse) else { return false }
+        openDockSubmenuKind = .files
+        rememberFilesFrame(rect)
+        return true
+    }
+
+    /// Files-list window under the cursor (tight height match). Never returns the root menu.
+    private static func filesListWindowContaining(_ mouse: NSPoint) -> CGRect? {
+        let expected = expectedSubmenuHeight(itemCount: dockFilePaths.count)
+        let cgMouse = quartzPoint(from: mouse)
+        let menus = onScreenMenuWindows().filter { $0.contains(cgMouse) }
+        // Prefer the window whose height is closest to the files list.
+        let ranked = menus
+            .map { (rect: $0, score: abs($0.height - expected)) }
+            .filter { $0.score <= submenuHeightTolerance }
+            .sorted { $0.score < $1.score }
+        return ranked.first?.rect
     }
 
     /// Resolve hovered Dock menu item via Accessibility (works when NSMenu highlight does not).
@@ -246,13 +303,16 @@ enum HubDockMenuBuilder {
             }
 
             let title = normalizeMenuTitle(rawTitle)
+            let titleFolded = title.lowercased()
 
             if let index = axMenuItemIndex(menuItem),
                index >= 0,
                index < dockFilePaths.count {
                 let path = dockFilePaths[index]
                 let name = URL(fileURLWithPath: path).lastPathComponent
-                if name == title || displayPath(path) == title || title.hasSuffix(name) {
+                if name.caseInsensitiveCompare(title) == .orderedSame
+                    || displayPath(path).caseInsensitiveCompare(title) == .orderedSame
+                    || titleFolded.hasSuffix(name.lowercased()) {
                     return path
                 }
             }
@@ -260,7 +320,9 @@ enum HubDockMenuBuilder {
             let matches = dockFilePaths.filter {
                 let name = URL(fileURLWithPath: $0).lastPathComponent
                 let shown = displayPath($0)
-                return name == title || shown == title || title.hasSuffix(name)
+                return name.caseInsensitiveCompare(title) == .orderedSame
+                    || shown.caseInsensitiveCompare(title) == .orderedSame
+                    || titleFolded.hasSuffix(name.lowercased())
             }
             if let only = matches.count == 1 ? matches[0] : nil {
                 return only
@@ -341,34 +403,51 @@ enum HubDockMenuBuilder {
     private static func pathFromOpenFilesSubmenu(_ mouse: NSPoint) -> String? {
         guard !dockFilePaths.isEmpty else { return nil }
         guard openDockSubmenuKind == .files || fileSubmenu?.highlightedItem != nil else { return nil }
-        guard let rect = dockSubmenuWindow(at: mouse, itemCount: dockFilePaths.count)
-                ?? menuWindowMatchingFilesHeight(containing: mouse)
-                ?? anyFilesSubmenuWindow() else {
-            return nil
-        }
-        // Cursor must be inside that files window (not the parent Dock menu).
-        let cocoa = cocoaRect(fromQuartz: rect)
+        guard let rect = locateFilesSubmenuWindow(mouse: mouse) else { return nil }
+        let cocoa = cocoaRect(fromQuartz: rect).insetBy(dx: -4, dy: -4)
         guard NSMouseInRect(mouse, cocoa, false) else { return nil }
-        let index = rowIndex(in: rect, mouse: mouse)
+        let index = rowIndex(in: rect, mouse: mouse, itemCount: dockFilePaths.count)
         guard index >= 0, index < dockFilePaths.count else { return nil }
         return dockFilePaths[index]
+    }
+
+    /// Best on-screen files-list window that contains the cursor (for path + hit-test).
+    private static func locateFilesSubmenuWindow(mouse: NSPoint) -> CGRect? {
+        filesListWindowContaining(mouse).map {
+            rememberFilesFrame($0)
+            return $0
+        }
+    }
+
+    /// Frame for positioning the tooltip: live window under cursor, else short-lived cache.
+    static func filesSubmenuFrame(mouse: NSPoint = NSEvent.mouseLocation) -> NSRect? {
+        guard !dockFilePaths.isEmpty else { return nil }
+        if let quartz = locateFilesSubmenuWindow(mouse: mouse) {
+            return cocoaRect(fromQuartz: quartz)
+        }
+        if openDockSubmenuKind == .files,
+           let cached = cachedFilesFrameQuartz,
+           Date.timeIntervalSinceReferenceDate - cachedFilesFrameAt < 0.35 {
+            return cocoaRect(fromQuartz: cached)
+        }
+        return nil
     }
 
     /// Like menuWindowContaining, but require height close to the files submenu.
     private static func menuWindowMatchingFilesHeight(containing mouse: NSPoint) -> CGRect? {
         guard !dockFilePaths.isEmpty else { return nil }
-        let expected = expectedSubmenuHeight(itemCount: dockFilePaths.count)
         guard let rect = menuWindowContaining(mouse, preferringItemCount: dockFilePaths.count) else {
             return nil
         }
-        guard abs(rect.height - expected) <= submenuHeightTolerance else { return nil }
+        guard looksLikeFilesMenu(height: rect.height, itemCount: dockFilePaths.count) else { return nil }
         return rect
     }
 
-    /// On-screen menu window whose height matches the files list (mouse may be elsewhere).
-    private static func anyFilesSubmenuWindow() -> CGRect? {
+    /// On-screen menu window whose height matches the files list, preferring near the mouse.
+    private static func anyFilesSubmenuWindowNear(_ mouse: NSPoint) -> CGRect? {
         guard !dockFilePaths.isEmpty else { return nil }
         let expectedHeight = expectedSubmenuHeight(itemCount: dockFilePaths.count)
+        let cgMouse = quartzPoint(from: mouse)
         guard let windowList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
@@ -388,8 +467,11 @@ enum HubDockMenuBuilder {
             let rect = CGRect(x: x, y: y, width: width, height: height)
             guard isMenuPopupWindow(info) else { continue }
             guard width >= 80, width <= 1400 else { continue }
-            let score = abs(height - expectedHeight)
-            guard score <= submenuHeightTolerance else { continue }
+            guard looksLikeFilesMenu(height: height, itemCount: dockFilePaths.count) else { continue }
+            let heightScore = abs(height - expectedHeight)
+            let dx = abs(rect.midX - cgMouse.x)
+            let dy = abs(rect.midY - cgMouse.y)
+            let score = heightScore + dx * 0.15 + dy * 0.05
             if let current = best {
                 if score < current.score { best = (rect, score) }
             } else {
@@ -397,6 +479,10 @@ enum HubDockMenuBuilder {
             }
         }
         return best?.rect
+    }
+
+    private static func anyFilesSubmenuWindow() -> CGRect? {
+        anyFilesSubmenuWindowNear(NSEvent.mouseLocation)
     }
 
     enum DockSubmenuKind {
@@ -462,7 +548,6 @@ enum HubDockMenuBuilder {
 
     private static func dockSubmenuWindow(at mouse: NSPoint, itemCount: Int) -> CGRect? {
         guard itemCount > 0 else { return nil }
-        let expectedHeight = expectedSubmenuHeight(itemCount: itemCount)
         let cgMouse = quartzPoint(from: mouse)
 
         guard let windowList = CGWindowListCopyWindowInfo(
@@ -485,70 +570,55 @@ enum HubDockMenuBuilder {
             guard rect.contains(cgMouse) else { continue }
             guard isMenuPopupWindow(info) else { continue }
             guard width >= 80, width <= 1400 else { continue }
-            guard abs(height - expectedHeight) <= submenuHeightTolerance else { continue }
+            guard looksLikeFilesMenu(height: height, itemCount: itemCount) else { continue }
+            rememberFilesFrame(rect)
             return rect
         }
 
         return nil
     }
 
-    private static func rowIndex(in window: CGRect, mouse: NSPoint) -> Int {
+    private static func rowIndex(in window: CGRect, mouse: NSPoint, itemCount: Int? = nil) -> Int {
+        let count = max(itemCount ?? dockFilePaths.count, 1)
         let cgMouse = quartzPoint(from: mouse)
-        let localY = cgMouse.y - window.minY
-        let padded = max(0, localY - 4)
-        return Int(padded / menuItemHeight)
+        let pad: CGFloat = 4
+        let usable = max(window.height - pad * 2, 1)
+        let rowH = usable / CGFloat(count)
+        let localY = cgMouse.y - window.minY - pad
+        let idx = Int(floor(localY / max(rowH, 1)))
+        return max(0, min(count - 1, idx))
     }
 
     static func inferOpenSubmenuKindIfNeeded() {
+        // Do NOT infer `.files` from geometry — the root Dock menu is often misclassified
+        // and then shows the path popup while hovering「隐藏」/「新建 R」. `.files` is set
+        // only in menuWillOpen for the history-files submenu.
         if openDockSubmenuKind != nil { return }
+        guard onScreenMenuWindows().count >= 2 else { return }
+
         let mouse = NSEvent.mouseLocation
         let cgMouse = quartzPoint(from: mouse)
-        guard let windowList = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return
-        }
-
-        for info in windowList {
-            guard let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
-                  let x = bounds["X"],
-                  let y = bounds["Y"],
-                  let width = bounds["Width"],
-                  let height = bounds["Height"] else {
-                continue
-            }
-            let rect = CGRect(x: x, y: y, width: width, height: height)
-            guard rect.contains(cgMouse) else { continue }
-            guard isMenuPopupWindow(info) else { continue }
-            guard width >= 80, width <= 1400, height >= 28, height < 900 else { continue }
-            if let kind = identifySubmenuKind(windowHeight: height) {
+        for rect in onScreenMenuWindows() where rect.contains(cgMouse) {
+            if let kind = identifySubmenuKind(windowHeight: rect.height), kind != .files {
                 openDockSubmenuKind = kind
-                return
-            }
-            // Unique height match against files even when projects count collides was nil.
-            if !dockFilePaths.isEmpty,
-               abs(height - expectedSubmenuHeight(itemCount: dockFilePaths.count)) <= submenuHeightTolerance {
-                openDockSubmenuKind = .files
                 return
             }
         }
     }
 
     private static func identifySubmenuKind(windowHeight: CGFloat) -> DockSubmenuKind? {
-        let tolerance = submenuHeightTolerance
         var matches: [DockSubmenuKind] = []
 
         if !dockFilePaths.isEmpty,
-           abs(windowHeight - expectedSubmenuHeight(itemCount: dockFilePaths.count)) <= tolerance {
+           looksLikeFilesMenu(height: windowHeight, itemCount: dockFilePaths.count) {
             matches.append(.files)
         }
         if !dockProjectPaths.isEmpty,
-           abs(windowHeight - expectedSubmenuHeight(itemCount: dockProjectPaths.count)) <= tolerance {
+           looksLikeFilesMenu(height: windowHeight, itemCount: dockProjectPaths.count) {
             matches.append(.projects)
         }
         if dockToolsItemCount > 0,
-           abs(windowHeight - expectedSubmenuHeight(itemCount: dockToolsItemCount)) <= tolerance {
+           looksLikeFilesMenu(height: windowHeight, itemCount: dockToolsItemCount) {
             matches.append(.tools)
         }
 
@@ -586,10 +656,11 @@ enum HubDockMenuBuilder {
             let rect = CGRect(x: x, y: y, width: width, height: height)
             guard rect.contains(cgMouse) else { continue }
             guard isMenuPopupWindow(info) else { continue }
-            guard width >= 120, width <= 1400, height >= 28, height < 900 else { continue }
+            guard width >= 80, width <= 1400, height >= 28, height < 900 else { continue }
             guard identifySubmenuKind(windowHeight: height) == .files else { continue }
 
-            let index = rowIndex(in: rect, mouse: mouse)
+            rememberFilesFrame(rect)
+            let index = rowIndex(in: rect, mouse: mouse, itemCount: dockFilePaths.count)
             guard index >= 0, index < dockFilePaths.count else { return nil }
             return dockFilePaths[index]
         }
@@ -647,17 +718,7 @@ enum HubDockMenuBuilder {
     }
 
     /// Cocoa-space frame of the on-screen「历史文件」submenu, if found.
-    static func filesSubmenuFrame(mouse: NSPoint = NSEvent.mouseLocation) -> NSRect? {
-        guard !dockFilePaths.isEmpty else { return nil }
-        if let quartz = dockSubmenuWindow(at: mouse, itemCount: dockFilePaths.count)
-            ?? menuWindowMatchingFilesHeight(containing: mouse) {
-            return cocoaRect(fromQuartz: quartz)
-        }
-        if openDockSubmenuKind == .files, let quartz = anyFilesSubmenuWindow() {
-            return cocoaRect(fromQuartz: quartz)
-        }
-        return nil
-    }
+    // (Implemented above as filesSubmenuFrame.)
 
     private static func makeProjectSubmenu(app: RStudioHubApp) -> NSMenuItem {
         let submenu = NSMenu()

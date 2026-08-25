@@ -21,6 +21,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dockMenuMonitorsActive = false
     private var lastDockFileTooltipPath: String?
     private var lastDockFileTooltipAt: TimeInterval = 0
+    private var lastDockFileHoverActivityAt: TimeInterval = 0
     private var pendingDockLaunchFocus = false
 
     var isHubMenuVisible: Bool { menuIsOpen || menuTrackingActive }
@@ -84,10 +85,16 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if !menuIsOpen && !dockMenuMonitorsActive {
-            HubPathTooltip.tearDown()
-            lastDockFileTooltipPath = nil
-            stopDockHoverMonitoring()
+            dismissPathTooltipCompletely()
         }
+    }
+
+    func applicationWillResignActive(_ notification: Notification) {
+        // Hub often resigns when the Dock menu opens — never tear down an active menu session.
+        if menuIsOpen || dockMenuMonitorsActive || HubDockMenuBuilder.openDockSubmenuKind != nil {
+            return
+        }
+        dismissPathTooltipCompletely()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -115,8 +122,8 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         applyDockMenuItems(to: dockMenu, RStudioWindowService.instancesFast())
+        menuIsOpen = true
         startDockFileTooltipMonitoring()
-        // Warm titles after returning so the *next* open has names without delaying this one.
         RStudioWindowService.warmTitlesInBackground()
         return dockMenu
     }
@@ -128,6 +135,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         ActivityLogger.shared.log("hub.terminate")
+        dismissPathTooltipCompletely()
         for observer in workspaceObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
@@ -161,12 +169,13 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuDidClose(_ menu: NSMenu) {
         if menu === HubDockMenuBuilder.fileSubmenu || menu === HubDockMenuBuilder.projectSubmenu {
             HubDockMenuBuilder.openDockSubmenuKind = nil
+            HubDockMenuBuilder.resetFilesFrameCache()
             clearDockFileTooltip()
             return
         }
 
-        HubPathTooltip.hide()
-        lastDockFileTooltipPath = nil
+        dismissPathTooltipCompletely()
+        HubDockMenuBuilder.resetFilesFrameCache()
 
         if menu !== dockMenu {
             return
@@ -177,7 +186,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             openMenu = nil
         }
 
-        stopDockHoverMonitoring()
+        stopDockFileTooltipMonitoring()
         // Dock delivers menu actions after the menu closes; keep click intent briefly.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.finishDockMenuSession()
@@ -189,13 +198,24 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stopDockFileTooltipMonitoring()
     }
 
+    private func dismissPathTooltipCompletely() {
+        lastDockFileTooltipPath = nil
+        lastDockFileTooltipAt = 0
+        lastDockFileHoverActivityAt = 0
+        HubPathTooltip.tearDown()
+        stopDockFileTooltipMonitoring()
+    }
+
     func menuWillHighlight(_ item: NSMenuItem?) {
-        // Dock often sends nil / copied items — never clear here (timer owns hide).
-        if let item,
-           item.action == #selector(dockOpenFile(_:)),
-           let path = item.representedObject as? String {
-            showDockFileTooltip(path)
+        // Any non-file highlight (隐藏 / 新建 R / …) must dismiss immediately.
+        guard let item,
+              item.action == #selector(dockOpenFile(_:)),
+              let path = item.representedObject as? String,
+              HubDockMenuBuilder.isMouseInsideFilesSubmenu() else {
+            clearDockFileTooltip()
+            return
         }
+        showDockFileTooltip(path)
     }
 
     private func startDockFileTooltipMonitoring() {
@@ -203,6 +223,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dockMenuMonitorsActive = true
         lastDockFileTooltipPath = nil
         lastDockFileTooltipAt = 0
+        lastDockFileHoverActivityAt = Date.timeIntervalSinceReferenceDate
         HubDockMenuBuilder.resetCloseZoneTracking()
 
         let trackClick: (NSEvent) -> Void = { _ in
@@ -232,8 +253,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.updateDockFileTooltip()
         }
 
-        // Must use .common — Dock menu tracking does not run .default mode timers.
-        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.03, repeats: true) { [weak self] _ in
             HubDockMenuBuilder.updateCloseZoneTracking()
             self?.updateDockFileTooltip()
         }
@@ -247,17 +267,21 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        HubDockMenuBuilder.inferOpenSubmenuKindIfNeeded()
+        // Requires 2 menu windows + cursor inside the files-height list — never the root menu alone.
+        guard HubDockMenuBuilder.isMouseInsideFilesSubmenu() else {
+            clearDockFileTooltip()
+            HubDockMenuBuilder.resetFilesFrameCache()
+            return
+        }
 
         if let path = HubDockMenuBuilder.filePathForHover() {
+            lastDockFileHoverActivityAt = Date.timeIntervalSinceReferenceDate
             showDockFileTooltip(path)
             return
         }
 
-        // Still inside the files list but row hit flickered — keep briefly without resetting the clock.
-        if HubDockMenuBuilder.isMouseInsideFilesSubmenu(),
-           let last = lastDockFileTooltipPath,
-           Date.timeIntervalSinceReferenceDate - lastDockFileTooltipAt < 0.2 {
+        if let last = lastDockFileTooltipPath,
+           Date.timeIntervalSinceReferenceDate - lastDockFileTooltipAt < 0.12 {
             HubPathTooltip.show(
                 HubDockMenuBuilder.displayPath(last),
                 toLeftOf: HubDockMenuBuilder.filesSubmenuFrame()
@@ -269,8 +293,15 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func showDockFileTooltip(_ path: String) {
+        guard dockMenuMonitorsActive,
+              HubDockMenuBuilder.isMouseInsideFilesSubmenu() else {
+            clearDockFileTooltip()
+            return
+        }
+        menuIsOpen = true
         lastDockFileTooltipPath = path
         lastDockFileTooltipAt = Date.timeIntervalSinceReferenceDate
+        lastDockFileHoverActivityAt = lastDockFileTooltipAt
         let display = HubDockMenuBuilder.displayPath(path)
         let anchor = HubDockMenuBuilder.filesSubmenuFrame()
         HubPathTooltip.show(display, toLeftOf: anchor)
@@ -308,7 +339,6 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         HubDockMenuBuilder.resetCloseZoneTracking()
         stopDockHoverMonitoring()
         dockMenuMonitorsActive = false
-        // Do not clear openDockSubmenuKind here — start*() calls stop*() first and would wipe .files.
         HubPathTooltip.tearDown()
     }
 
