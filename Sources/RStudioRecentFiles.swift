@@ -26,7 +26,17 @@ enum RStudioRecentFiles {
                     && FileManager.default.fileExists(atPath: path)
             }
 
-        let entries = paths.map { path in
+        // Keep first (newest) when the same path appears again; compare case-insensitively.
+        var seen = Set<String>()
+        var uniquePaths: [String] = []
+        uniquePaths.reserveCapacity(paths.count)
+        for path in paths {
+            let key = path.lowercased()
+            guard seen.insert(key).inserted else { continue }
+            uniquePaths.append(path)
+        }
+
+        let entries = uniquePaths.map { path in
             FileHistoryEntry(name: URL(fileURLWithPath: path).lastPathComponent, path: path)
         }
         return HubNameSort.sorted(entries) { $0.name }
