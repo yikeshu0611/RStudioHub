@@ -10,6 +10,7 @@ final class InstanceMenuRowView: MenuRowHoverView {
 
     private let dotView = NSImageView()
     private let titleField = NSTextField(labelWithString: "")
+    private let closeBackground = NSView()
     private let closeView = NSImageView()
     private var closeHitRect = NSRect.zero
 
@@ -42,14 +43,26 @@ final class InstanceMenuRowView: MenuRowHoverView {
         addSubview(dotView)
 
         closeHitRect = NSRect(
-            x: Self.rowWidth - rightInset - closeSize,
-            y: (Self.rowHeight - closeSize) / 2,
+            x: Self.rowWidth - rightInset - closeSize - 4,
+            y: 1,
+            width: closeSize + 8,
+            height: Self.rowHeight - 2
+        )
+        closeBackground.frame = closeHitRect
+        closeBackground.wantsLayer = true
+        closeBackground.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.55).cgColor
+        closeBackground.layer?.cornerRadius = 4
+        addSubview(closeBackground)
+
+        closeView.frame = NSRect(
+            x: closeHitRect.midX - closeSize / 2,
+            y: closeHitRect.midY - closeSize / 2,
             width: closeSize,
             height: closeSize
         )
-        closeView.frame = closeHitRect
         closeView.image = Self.closeImage
         closeView.imageScaling = .scaleProportionallyDown
+        closeView.contentTintColor = .labelColor
         closeView.toolTip = "关闭此实例"
         addSubview(closeView)
 
@@ -68,7 +81,13 @@ final class InstanceMenuRowView: MenuRowHoverView {
     override func hoverStateDidChange(_ hovered: Bool) {
         titleField.textColor = hovered ? .alternateSelectedControlTextColor : .labelColor
         dotView.contentTintColor = hovered ? .alternateSelectedControlTextColor : nil
-        closeView.contentTintColor = hovered ? .alternateSelectedControlTextColor : nil
+        if hovered {
+            closeBackground.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.28).cgColor
+            closeView.contentTintColor = .alternateSelectedControlTextColor
+        } else {
+            closeBackground.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.55).cgColor
+            closeView.contentTintColor = .labelColor
+        }
     }
 
     override func mouseDown(with event: NSEvent) {

@@ -192,6 +192,98 @@ enum DockPolicyService {
         return true
     }
 
+    /// Open an R script / file in the current (preferred) RStudio instance.
+    /// Falls back to a new hidden instance when none are running.
+    @discardableResult
+    static func openFileInCurrentInstance(at path: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: path) else {
+            ActivityLogger.shared.log("launch.file missing path=\(path)")
+            return false
+        }
+
+        let instances = RStudioWindowService.instancesFast()
+        if instances.isEmpty {
+            ActivityLogger.shared.log("launch.file noInstance → newHidden path=\(path)")
+            return openFileInNewHiddenInstance(at: path)
+        }
+
+        guard let pid = RStudioWindowService.preferredPID(for: instances) else {
+            ActivityLogger.shared.log("launch.file noPreferred → newHidden path=\(path)")
+            return openFileInNewHiddenInstance(at: path)
+        }
+
+        RStudioWindowService.activate(pid: pid)
+        let ok = sendOpenDocument(path: path, toPID: pid)
+        ActivityLogger.shared.log("launch.file current pid=\(pid) ok=\(ok) path=\(path)")
+
+        // Opening via Launch Services / AE can briefly surface a Dock tile.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            hideInstanceFromDock(pid: pid)
+            reinforceHideFromDock()
+        }
+        return ok
+    }
+
+    /// Open file in a brand-new Dock-hidden RStudio (only when no instance exists).
+    @discardableResult
+    private static func openFileInNewHiddenInstance(at path: String) -> Bool {
+        guard let dylibPath, FileManager.default.fileExists(atPath: dylibPath) else {
+            ActivityLogger.shared.log("launch.file fallback=open without dylib path=\(path)")
+            return NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        }
+
+        beginLaunchGracePeriod()
+        RStudioWindowService.pendingProjectPath = nil
+
+        if launchViaDirectBinary(dylibPath: dylibPath, projectPath: path, activateWhenReady: true) {
+            ActivityLogger.shared.log("launch.file.new dylib=true mode=directBinary path=\(path)")
+            return true
+        }
+
+        return launchProjectViaOpenHidden(path: path, dylibPath: dylibPath)
+    }
+
+    /// Deliver "open documents" Apple Event to a specific RStudio process.
+    private static func sendOpenDocument(path: String, toPID pid: pid_t) -> Bool {
+        var targetPID = pid
+        guard let target = NSAppleEventDescriptor(
+            descriptorType: typeKernelProcessID,
+            bytes: &targetPID,
+            length: MemoryLayout<pid_t>.size
+        ) else {
+            ActivityLogger.shared.log("launch.file ae targetFailed pid=\(pid)")
+            return false
+        }
+
+        let event = NSAppleEventDescriptor(
+            eventClass: AEEventClass(kCoreEventClass),
+            eventID: AEEventID(kAEOpenDocuments),
+            targetDescriptor: target,
+            returnID: AEReturnID(kAutoGenerateReturnID),
+            transactionID: AETransactionID(kAnyTransactionID)
+        )
+
+        let fileURL = URL(fileURLWithPath: path)
+        let fileDesc = NSAppleEventDescriptor(fileURL: fileURL)
+        let list = NSAppleEventDescriptor.list()
+        list.insert(fileDesc, at: 1)
+        event.setParam(list, forKeyword: keyDirectObject)
+
+        do {
+            _ = try event.sendEvent(options: [.noReply], timeout: 2)
+            return true
+        } catch {
+            ActivityLogger.shared.log("launch.file ae failed pid=\(pid) error=\(error.localizedDescription)")
+            // Fallback: activate then open without creating a new instance.
+            let appURL = URL(fileURLWithPath: RStudioDiscovery.appPath)
+            let config = NSWorkspace.OpenConfiguration()
+            config.createsNewApplicationInstance = false
+            config.activates = true
+            NSWorkspace.shared.open([fileURL], withApplicationAt: appURL, configuration: config)
+            return true
+        }
+    }
+
     /// Launch RStudio Mach-O directly so DockHide.dylib loads before NSApp starts.
     private static func launchViaDirectBinary(
         dylibPath: String,

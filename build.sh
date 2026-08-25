@@ -45,7 +45,6 @@ SWIFT_SOURCES=(
   "$ROOT_DIR/Sources/MenuTabBarView.swift"
   "$ROOT_DIR/Sources/MenuRowHoverView.swift"
   "$ROOT_DIR/Sources/MenuLayout.swift"
-  "$ROOT_DIR/Sources/ProjectMenuRowView.swift"
   "$ROOT_DIR/Sources/InstanceMenuRowView.swift"
   "$ROOT_DIR/Sources/ActionButtonsView.swift"
   "$ROOT_DIR/Sources/HubShortcut.swift"

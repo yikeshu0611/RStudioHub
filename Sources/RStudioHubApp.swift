@@ -13,8 +13,8 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let doublePressInterval: TimeInterval = 0.3
     private var selectedTab: HubMenuTab = .current
     private var isRecordingShortcut = false
-    private var dockRightZoneClickPending = false
     private var dockMouseMonitor: Any?
+    private var dockClickMonitorLocal: Any?
     private var dockHoverMonitorLocal: Any?
     private var dockHoverMonitorGlobal: Any?
     private var dockHoverTimer: Timer?
@@ -114,7 +114,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         applyDockMenuItems(to: dockMenu, RStudioWindowService.instancesFast())
-        startDockCloseClickMonitor()
+        startDockFileTooltipMonitoring()
         // Warm titles after returning so the *next* open has names without delaying this one.
         RStudioWindowService.warmTitlesInBackground()
         return dockMenu
@@ -135,9 +135,14 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         menuIsOpen = true
         openMenu = menu
+        if menu === HubDockMenuBuilder.fileSubmenu {
+            HubDockMenuBuilder.openDockSubmenuKind = .files
+        } else if menu === HubDockMenuBuilder.projectSubmenu {
+            HubDockMenuBuilder.openDockSubmenuKind = .projects
+        }
         if menu === dockMenu {
             applyDockMenuItems(to: menu, RStudioWindowService.instancesFast())
-            startDockCloseClickMonitor()
+            startDockFileTooltipMonitoring()
             RStudioWindowService.warmTitlesInBackground()
         } else {
             rebuildMenu(menu)
@@ -147,6 +152,10 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuDidClose(_ menu: NSMenu) {
         HubPathTooltip.hide()
         lastDockFileTooltipPath = nil
+
+        if menu === HubDockMenuBuilder.fileSubmenu || menu === HubDockMenuBuilder.projectSubmenu {
+            HubDockMenuBuilder.openDockSubmenuKind = nil
+        }
 
         if menu !== dockMenu {
             return
@@ -158,10 +167,14 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         stopDockHoverMonitoring()
-        // Keep the last close-zone hit briefly; Dock sends the action after the menu closes.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            self?.stopDockClickMonitoring()
+        // Dock delivers menu actions after the menu closes; keep click intent briefly.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.finishDockMenuSession()
         }
+    }
+
+    private func finishDockMenuSession() {
+        stopDockFileTooltipMonitoring()
     }
 
     func menuWillHighlight(_ item: NSMenuItem?) {
@@ -173,19 +186,22 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showDockFileTooltip(path)
     }
 
-    private func startDockCloseClickMonitor() {
-        stopDockCloseClickMonitor()
+    private func startDockFileTooltipMonitoring() {
+        stopDockFileTooltipMonitoring()
         dockMenuMonitorsActive = true
-        dockRightZoneClickPending = false
         lastDockFileTooltipPath = nil
-        dockMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
-            guard let self else { return }
-            let inRightZone = HubDockMenuBuilder.isRightZoneClick(event: event)
-            if event.type == .leftMouseDown {
-                self.dockRightZoneClickPending = inRightZone
-            } else if event.type == .leftMouseUp, inRightZone {
-                self.dockRightZoneClickPending = true
-            }
+        HubDockMenuBuilder.resetCloseZoneTracking()
+
+        let trackClick: (NSEvent) -> Void = { _ in
+            HubDockMenuBuilder.updateCloseZoneTracking()
+        }
+
+        dockClickMonitorLocal = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .mouseMoved]) { event in
+            trackClick(event)
+            return event
+        }
+        dockMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .mouseMoved]) { event in
+            trackClick(event)
         }
 
         startDockHoverMonitoring()
@@ -204,6 +220,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         dockHoverTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            HubDockMenuBuilder.updateCloseZoneTracking()
             self?.updateDockFileTooltip()
         }
     }
@@ -247,17 +264,19 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         clearDockFileTooltip()
     }
 
-    private func stopDockClickMonitoring() {
+    private func stopDockFileTooltipMonitoring() {
+        if let dockClickMonitorLocal {
+            NSEvent.removeMonitor(dockClickMonitorLocal)
+            self.dockClickMonitorLocal = nil
+        }
         if let dockMouseMonitor {
             NSEvent.removeMonitor(dockMouseMonitor)
             self.dockMouseMonitor = nil
         }
-        dockMenuMonitorsActive = false
-    }
-
-    private func stopDockCloseClickMonitor() {
+        HubDockMenuBuilder.resetCloseZoneTracking()
         stopDockHoverMonitoring()
-        stopDockClickMonitoring()
+        dockMenuMonitorsActive = false
+        HubDockMenuBuilder.openDockSubmenuKind = nil
     }
 
     func beginShortcutRecording(reopenMenu: Bool) {
@@ -524,16 +543,15 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             items.append(emptyItem)
         } else {
             for entry in projects {
-                let item = NSMenuItem()
-                item.view = ProjectMenuRowView(
-                    entry: entry,
-                    onOpenCurrent: { [weak self] project in
-                        self?.openProjectInCurrentWindow(project)
-                    },
-                    onOpenNew: { [weak self] project in
-                        self?.openProjectInNewWindow(project)
-                    }
+                guard let path = entry.path else { continue }
+                let item = NSMenuItem(
+                    title: entry.name,
+                    action: #selector(dockOpenProject(_:)),
+                    keyEquivalent: ""
                 )
+                item.target = self
+                item.representedObject = path
+                item.toolTip = entry.path ?? entry.name
                 items.append(item)
             }
         }
@@ -554,20 +572,25 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func dockInstanceRowAction(_ sender: NSMenuItem) {
-        guard let ref = sender.representedObject as? DockInstanceRowRef else { return }
-        // Prefer the flag captured while the Dock menu was still open.
-        // Avoid re-scanning CG windows here — that was adding noticeable lag.
-        let shouldClose = dockRightZoneClickPending
-        dockRightZoneClickPending = false
+        guard let pidNumber = sender.representedObject as? NSNumber else { return }
+        let pid = pid_t(pidNumber.int32Value)
+
+        let shouldClose = HubDockMenuBuilder.consumeCloseZoneClick()
+            || NSEvent.modifierFlags.contains(.option)
 
         if shouldClose {
-            ActivityLogger.shared.log("hub.dockClose pid=\(ref.pid)")
-            hubCloseInstance(pid: ref.pid)
+            ActivityLogger.shared.log("hub.dockClose pid=\(pid)")
+            closeInstance(pid: pid)
             return
         }
 
-        ActivityLogger.shared.log("hub.switch pid=\(ref.pid)")
-        RStudioWindowService.activate(pid: ref.pid)
+        ActivityLogger.shared.log("hub.switch pid=\(pid)")
+        let instances = RStudioWindowService.instancesFast()
+        if let instance = instances.first(where: { $0.pid == pid }) {
+            activateInstance(instance)
+        } else {
+            RStudioWindowService.activate(pid: pid)
+        }
     }
 
     @objc func dockActivateInstance(_ sender: NSMenuItem) {
@@ -583,6 +606,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func dockCloseInstance(_ sender: NSMenuItem) {
         guard let pidNumber = sender.representedObject as? NSNumber else { return }
+        ActivityLogger.shared.log("hub.dockClose pid=\(pidNumber.int32Value)")
         closeInstance(pid: pid_t(pidNumber.int32Value))
     }
 
@@ -603,25 +627,6 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RStudioMenuBridge.performToolsAction(action)
     }
 
-    @objc func dockProjectRowAction(_ sender: NSMenuItem) {
-        guard let ref = sender.representedObject as? DockProjectRowRef else { return }
-        let openNewWindow = dockRightZoneClickPending
-        dockRightZoneClickPending = false
-
-        let entry = ProjectHistoryStore.shared.allEntries().first { $0.path == ref.path }
-            ?? ProjectHistoryStore.shared.allEntries().first {
-                ProjectHistoryStore.shared.resolveOpenPath(for: $0) == ref.path
-            }
-            ?? ProjectHistoryStore.shared.allEntries().first { $0.name == ref.path }
-
-        guard let entry else { return }
-        if openNewWindow {
-            openProjectInNewWindow(entry)
-        } else {
-            openProjectInCurrentWindow(entry)
-        }
-    }
-
     @objc func dockOpenProject(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
         let entry = ProjectHistoryStore.shared.allEntries().first { $0.path == path }
@@ -629,7 +634,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ProjectHistoryStore.shared.resolveOpenPath(for: $0) == path
             }
         guard let entry else { return }
-        openProjectInCurrentWindow(entry)
+        openProjectInNewWindow(entry)
     }
 
     @objc func dockCreateNewRproj() {
@@ -667,32 +672,8 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         ActivityLogger.shared.log("hub.openFile path=\(path)")
-        let fileURL = URL(fileURLWithPath: path)
-        let appURL = URL(fileURLWithPath: RStudioDiscovery.appPath)
-        let config = NSWorkspace.OpenConfiguration()
-        config.activates = true
-
-        NSWorkspace.shared.open([fileURL], withApplicationAt: appURL, configuration: config) { _, error in
-            if let error {
-                DispatchQueue.main.async { [weak self] in
-                    self?.showLaunchError(message: "无法打开文件：\(error.localizedDescription)")
-                }
-            }
-        }
-    }
-
-    private func openProjectInCurrentWindow(_ entry: ProjectHistoryEntry) {
-        guard let path = ProjectHistoryStore.shared.resolveOpenPath(for: entry) else {
-            ActivityLogger.shared.log("hub.openProject.current missingPath name=\(entry.name)")
-            showLaunchError(message: "找不到项目文件：\(entry.name)\n请先在 RStudio 中打开过该项目。")
-            return
-        }
-
-        ActivityLogger.shared.log("hub.openProject.replace name=\(entry.name) path=\(path)")
-        ProjectHistoryStore.shared.record(name: entry.name, path: path)
-
-        if !DockPolicyService.openProjectInCurrentWindow(at: path) {
-            showLaunchError(message: "无法打开项目：\(entry.name)")
+        if !DockPolicyService.openFileInCurrentInstance(at: path) {
+            showLaunchError(message: "无法打开文件：\(URL(fileURLWithPath: path).lastPathComponent)")
         }
     }
 

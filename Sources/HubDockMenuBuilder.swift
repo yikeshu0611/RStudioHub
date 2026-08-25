@@ -1,10 +1,12 @@
 import AppKit
 
 enum HubDockMenuBuilder {
-    /// Dock menus pad the right edge; the ✕ sits left of that padding.
-    private static let closeZoneWidth: CGFloat = 72
+    /// Dock menus pad the right edge; treat this strip as the ✕ hit zone.
+    private static let closeZoneWidth: CGFloat = 110
     private static let titleTrailingPadding: CGFloat = 28
-    private static let newWindowMark = "↗"
+
+    /// Updated continuously while the Dock menu is open.
+    private(set) static var lastMouseInCloseZone = false
 
     static func makeItems(instances: [RStudioInstance], app: RStudioHubApp) -> [NSMenuItem] {
         var items: [NSMenuItem] = []
@@ -51,8 +53,8 @@ enum HubDockMenuBuilder {
                 keyEquivalent: ""
             )
             item.target = app
-            item.representedObject = DockInstanceRowRef(pid: instance.pid)
-            item.toolTip = "点击名称切换，点击右侧 ✕ 关闭"
+            item.representedObject = NSNumber(value: instance.pid)
+            item.toolTip = "点击名称切换 · 点击右侧 ✕ 关闭"
             items.append(item)
         }
 
@@ -70,21 +72,107 @@ enum HubDockMenuBuilder {
         return min(max(maxTextWidth + closeZoneWidth + 8, MenuLayout.minWidth), MenuLayout.maxWidth)
     }
 
+    /// Plain title only — Dock strips attributed backgrounds/attachments.
     private static func rowTitle(
         marker: String,
         title: String,
         contentWidth: CGFloat,
-        font: NSFont,
-        trailingMark: String = "✕"
+        font: NSFont
     ) -> String {
+        let closeMark = "✕"
         let base = "\(marker)\(title)"
-        let baseWidth = (base as NSString).size(withAttributes: [.font: font]).width
-        let markWidth = (trailingMark as NSString).size(withAttributes: [.font: font]).width
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        let baseWidth = (base as NSString).size(withAttributes: attrs).width
+        let markWidth = (closeMark as NSString).size(withAttributes: attrs).width
+        let spaceWidth = max((" " as NSString).size(withAttributes: attrs).width, 1)
         let usableWidth = contentWidth - titleTrailingPadding
         let gap = usableWidth - baseWidth - markWidth
-        let spaceWidth = max((" " as NSString).size(withAttributes: [.font: font]).width, 1)
         let spaces = max(2, Int(gap / spaceWidth))
-        return base + String(repeating: " ", count: spaces) + trailingMark
+        return base + String(repeating: " ", count: spaces) + closeMark
+    }
+
+    /// Call while Dock menu is open (hover / click) so ✕ hits are sticky until the action runs.
+    static func updateCloseZoneTracking(mouse: NSPoint = NSEvent.mouseLocation) {
+        let inZone = isCloseZone(at: mouse)
+        if inZone {
+            lastMouseInCloseZone = true
+        } else if NSEvent.pressedMouseButtons == 0 {
+            // Only clear when not dragging a click, so mouse-down-in-zone stays armed.
+            lastMouseInCloseZone = false
+        }
+    }
+
+    static func consumeCloseZoneClick() -> Bool {
+        let result = lastMouseInCloseZone || isCloseZone()
+        lastMouseInCloseZone = false
+        return result
+    }
+
+    static func resetCloseZoneTracking() {
+        lastMouseInCloseZone = false
+    }
+
+    private static func isCloseZone(at mouse: NSPoint = NSEvent.mouseLocation) -> Bool {
+        guard let frame = menuFrameContaining(mouse) else { return false }
+        let localX = mouse.x - frame.minX
+        let zone = max(closeZoneWidth, frame.width * 0.32)
+        return localX >= frame.width - zone
+    }
+
+    private static func menuFrameContaining(_ mouse: NSPoint) -> CGRect? {
+        for window in NSApp.windows where window.isVisible {
+            let frame = window.frame
+            guard frame.width >= 120, frame.width <= 700, frame.height >= 40, frame.height < 900 else { continue }
+            if NSMouseInRect(mouse, frame, false) {
+                return frame
+            }
+        }
+
+        let cgMouse = quartzPoint(from: mouse)
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+
+        var best: CGRect?
+        for info in windowList {
+            guard let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = bounds["X"],
+                  let y = bounds["Y"],
+                  let width = bounds["Width"],
+                  let height = bounds["Height"] else {
+                continue
+            }
+
+            let quartzRect = CGRect(x: x, y: y, width: width, height: height)
+            guard quartzRect.contains(cgMouse) else { continue }
+            guard isMenuPopupWindow(info) else { continue }
+            guard width >= 120, width <= 700, height >= 40, height < 900 else { continue }
+
+            let cocoa = cocoaRect(fromQuartz: quartzRect)
+            if let current = best {
+                if cocoa.height > current.height {
+                    best = cocoa
+                }
+            } else {
+                best = cocoa
+            }
+        }
+        return best
+    }
+
+    private static func cocoaRect(fromQuartz rect: CGRect) -> CGRect {
+        guard let screen = NSScreen.screens.first(where: {
+            let cocoaY = $0.frame.maxY - rect.maxY
+            let candidate = NSRect(x: rect.minX, y: cocoaY, width: rect.width, height: rect.height)
+            return $0.frame.intersects(candidate)
+        }) ?? NSScreen.main else {
+            return NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height)
+        }
+        let cocoaY = screen.frame.maxY - rect.maxY
+        return NSRect(x: rect.minX, y: cocoaY, width: rect.width, height: rect.height)
     }
 
     private static let menuItemHeight: CGFloat = 24
@@ -94,8 +182,10 @@ enum HubDockMenuBuilder {
     private(set) static var dockFilePaths: [String] = []
     private(set) static var dockProjectPaths: [String] = []
     private(set) static var dockToolsItemCount: Int = RStudioToolsAction.allCases.count
+    static weak var fileSubmenu: NSMenu?
+    static weak var projectSubmenu: NSMenu?
+    static var openDockSubmenuKind: DockSubmenuKind?
 
-    /// Dock menus do not call `menuWillHighlight`; resolve hovered file path from submenu geometry.
     static func filePathAtMouse(_ mouse: NSPoint = NSEvent.mouseLocation) -> String? {
         filePathAtMouseViaSubmenuKind(mouse) ?? {
             guard !dockFilePaths.isEmpty else { return nil }
@@ -106,7 +196,7 @@ enum HubDockMenuBuilder {
         }()
     }
 
-    private enum DockSubmenuKind {
+    enum DockSubmenuKind {
         case files
         case projects
         case tools
@@ -121,7 +211,7 @@ enum HubDockMenuBuilder {
             return true
         }
         if let owner = info[kCGWindowOwnerName as String] as? String {
-            return owner == "Dock" || owner == "Window Server"
+            return owner == "Dock" || owner == "Window Server" || owner == "RStudioHub"
         }
         return false
     }
@@ -219,66 +309,6 @@ enum HubDockMenuBuilder {
         return nil
     }
 
-    /// Right-side action zone (close ✕ or new-window ↗).
-    static func isRightZoneClick(event: NSEvent?) -> Bool {
-        isCloseClick(event: event)
-    }
-
-    /// Detect close by mouse X against the actual menu window (Dock menus are not in NSApp.windows).
-    static func isCloseClick(event: NSEvent?) -> Bool {
-        let mouse = NSEvent.mouseLocation
-
-        if let window = resolveAppMenuWindow(event: event, mouse: mouse) {
-            let localX = mouse.x - window.frame.minX
-            return localX >= window.frame.width - closeZoneWidth
-        }
-
-        return isCloseClickViaScreenWindow(mouse: mouse)
-    }
-
-    private static func resolveAppMenuWindow(event: NSEvent?, mouse: NSPoint) -> NSWindow? {
-        if let window = event?.window, NSMouseInRect(mouse, window.frame, false) {
-            return window
-        }
-
-        return NSApp.windows.first { window in
-            window.isVisible
-                && window.frame.width >= 120
-                && window.frame.height >= 40
-                && NSMouseInRect(mouse, window.frame, false)
-        }
-    }
-
-    private static func isCloseClickViaScreenWindow(mouse: NSPoint) -> Bool {
-        guard let windowList = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return false
-        }
-
-        let cgMouse = quartzPoint(from: mouse)
-
-        for info in windowList {
-            guard let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
-                  let x = bounds["X"],
-                  let y = bounds["Y"],
-                  let width = bounds["Width"],
-                  let height = bounds["Height"] else {
-                continue
-            }
-
-            let rect = CGRect(x: x, y: y, width: width, height: height)
-            guard rect.contains(cgMouse) else { continue }
-            guard width >= 140, height >= 40, height < 900 else { continue }
-
-            let localX = cgMouse.x - rect.minX
-            return localX >= width - closeZoneWidth
-        }
-
-        return false
-    }
-
     private static func quartzPoint(from cocoaPoint: NSPoint) -> CGPoint {
         guard let screen = NSScreen.screens.first(where: { NSMouseInRect(cocoaPoint, $0.frame, false) })
                 ?? NSScreen.main else {
@@ -291,6 +321,7 @@ enum HubDockMenuBuilder {
     private static func makeFileSubmenu(app: RStudioHubApp) -> NSMenuItem {
         let submenu = NSMenu()
         submenu.delegate = app
+        fileSubmenu = submenu
         let files = RStudioRecentFiles.allEntries()
         dockFilePaths = files.map(\.path)
 
@@ -320,6 +351,8 @@ enum HubDockMenuBuilder {
 
     private static func makeProjectSubmenu(app: RStudioHubApp) -> NSMenuItem {
         let submenu = NSMenu()
+        submenu.delegate = app
+        projectSubmenu = submenu
         let projects = ProjectHistoryStore.shared.allEntries()
         dockProjectPaths = projects.compactMap(\.path)
 
@@ -329,17 +362,16 @@ enum HubDockMenuBuilder {
             emptyItem.isEnabled = false
             submenu.addItem(emptyItem)
         } else {
-            let font = NSFont.menuFont(ofSize: NSFont.systemFontSize)
-            let contentWidth = dockProjectContentWidth(for: projects, font: font)
             for entry in projects {
+                guard let path = entry.path else { continue }
                 let item = NSMenuItem(
-                    title: projectRowTitle(name: entry.name, contentWidth: contentWidth, font: font),
-                    action: #selector(RStudioHubApp.dockProjectRowAction(_:)),
+                    title: entry.name,
+                    action: #selector(RStudioHubApp.dockOpenProject(_:)),
                     keyEquivalent: ""
                 )
                 item.target = app
-                item.representedObject = DockProjectRowRef(path: entry.path ?? entry.name)
-                item.toolTip = "点击名称：关闭当前 RStudio 后打开；点击右侧 ↗：新窗口打开"
+                item.representedObject = path
+                item.toolTip = entry.path ?? entry.name
                 submenu.addItem(item)
             }
         }
@@ -347,19 +379,6 @@ enum HubDockMenuBuilder {
         let root = NSMenuItem(title: "历史项目", action: nil, keyEquivalent: "")
         root.submenu = submenu
         return root
-    }
-
-    private static func dockProjectContentWidth(for projects: [ProjectHistoryEntry], font: NSFont) -> CGFloat {
-        var maxTextWidth: CGFloat = 120
-        for entry in projects {
-            let width = (entry.name as NSString).size(withAttributes: [.font: font]).width
-            maxTextWidth = max(maxTextWidth, width)
-        }
-        return min(max(maxTextWidth + closeZoneWidth + 8, MenuLayout.minWidth), MenuLayout.maxWidth)
-    }
-
-    private static func projectRowTitle(name: String, contentWidth: CGFloat, font: NSFont) -> String {
-        rowTitle(marker: "", title: name, contentWidth: contentWidth, font: font, trailingMark: newWindowMark)
     }
 
     private static func makeActionItems(instances: [RStudioInstance], app: RStudioHubApp) -> [NSMenuItem] {
@@ -386,21 +405,5 @@ enum HubDockMenuBuilder {
         quitAll.isEnabled = !instances.isEmpty
 
         return [newR, newRproj, quitAll]
-    }
-}
-
-final class DockInstanceRowRef: NSObject {
-    let pid: pid_t
-
-    init(pid: pid_t) {
-        self.pid = pid
-    }
-}
-
-final class DockProjectRowRef: NSObject {
-    let path: String
-
-    init(path: String) {
-        self.path = path
     }
 }
