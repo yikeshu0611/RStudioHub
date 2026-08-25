@@ -316,6 +316,28 @@ enum RStudioWindowService {
         raiseMainWindow(pid: instance.pid)
     }
 
+    static func noteLaunching(pid: pid_t) {
+        noteFocused(pid: pid)
+        if !cachedInstances.contains(where: { $0.pid == pid }) {
+            cachedInstances.append(RStudioInstance(pid: pid, title: "", isActive: true))
+        }
+    }
+
+    /// Bring a newly launched instance forward as soon as its process exists.
+    static func activateForNewLaunch(pid: pid_t) {
+        noteFocused(pid: pid)
+        let delays: [TimeInterval] = [0, 0.12, 0.28, 0.5, 0.85]
+        for delay in delays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return }
+                app.activate(options: [.activateIgnoringOtherApps])
+                if delay >= 0.28 {
+                    raiseMainWindow(pid: pid)
+                }
+            }
+        }
+    }
+
     /// Hot path for Dock / shortcut switching — never block on title resolution.
     static func activate(pid: pid_t) {
         let cachedTitle = titleByPID[pid]

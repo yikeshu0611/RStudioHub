@@ -46,8 +46,8 @@ static void ApplyAccessoryPolicy(void) {
 static void ScheduleAccessoryPolicyBurst(void) {
     // Hide from Dock as early and as often as possible during launch.
     ApplyAccessoryPolicy();
-    for (int i = 0; i < 8; i++) {
-        double delay = 0.01 * (i + 1);
+    for (int i = 0; i < 3; i++) {
+        double delay = 0.02 * (i + 1);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             ApplyAccessoryPolicy();
         });

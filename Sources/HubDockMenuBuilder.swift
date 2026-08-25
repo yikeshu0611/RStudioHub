@@ -300,14 +300,6 @@ enum HubDockMenuBuilder {
             emptyItem.isEnabled = false
             submenu.addItem(emptyItem)
         } else {
-            let font = NSFont.menuFont(ofSize: NSFont.systemFontSize)
-            var maxWidth: CGFloat = MenuLayout.minWidth
-            for entry in files {
-                let width = (entry.name as NSString).size(withAttributes: [.font: font]).width
-                maxWidth = max(maxWidth, width + 36)
-            }
-            let menuWidth = min(max(maxWidth, MenuLayout.minWidth), MenuLayout.maxWidth)
-
             for entry in files {
                 let item = NSMenuItem(
                     title: entry.name,
@@ -317,7 +309,6 @@ enum HubDockMenuBuilder {
                 item.target = app
                 item.representedObject = entry.path
                 item.toolTip = entry.path
-                item.view = DockFileMenuRowView(name: entry.name, path: entry.path, width: menuWidth)
                 submenu.addItem(item)
             }
         }

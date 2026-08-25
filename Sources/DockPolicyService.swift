@@ -9,6 +9,7 @@ enum DockPolicyService {
     private static let dylibPIDDefaultsKey = "dylibInjectedPIDs"
     private static var suppressReinforceUntil: Date?
     private static var lldbHiddenPIDs: Set<Int> = []
+    private static var trackedNewInstancePIDs: Set<pid_t> = []
 
     static var dylibPath: String? {
         Bundle.main.path(forResource: "DockHide", ofType: "dylib")
@@ -53,25 +54,31 @@ enum DockPolicyService {
         if isInLaunchGracePeriod() {
             markDylibInjected(pid: pid)
             ActivityLogger.shared.log("dock.launchGrace markDylib pid=\(pid)")
-            reinforceHideSoon(pid: pid)
         }
     }
 
     static func noteProcessTerminated(pid: pid_t) {
         lldbHiddenPIDs.remove(Int(pid))
+        trackedNewInstancePIDs.remove(pid)
         pruneDylibPIDList()
     }
 
     /// New instance launched with dylib — hide Dock tile immediately.
-    static func onNewInstanceLaunched(pid: pid_t) {
+    static func onNewInstanceLaunched(pid: pid_t, activate: Bool = false) {
+        guard trackedNewInstancePIDs.insert(pid).inserted else { return }
+
         markDylibInjected(pid: pid)
         if let path = RStudioWindowService.pendingProjectPath {
             RStudioWindowService.rememberProject(pid: pid, path: path)
             RStudioWindowService.pendingProjectPath = nil
         }
         hideInstanceFromDock(pid: pid)
-        reinforceHideSoon(pid: pid)
-        ActivityLogger.shared.log("dock.newInstance pid=\(pid) hide=immediate")
+        RStudioWindowService.noteLaunching(pid: pid)
+        ActivityLogger.shared.log("dock.newInstance pid=\(pid) hide=immediate activate=\(activate)")
+
+        if activate {
+            RStudioWindowService.activateForNewLaunch(pid: pid)
+        }
     }
 
     /// RStudio launched outside Hub (no dylib): hide only this process, once.
@@ -81,38 +88,36 @@ enum DockPolicyService {
     }
 
     @discardableResult
-    static func launchNewInstanceHiddenFromDock() -> Bool {
+    static func launchNewInstanceHiddenFromDock(activateWhenReady: Bool = false) -> Bool {
         guard let dylibPath, FileManager.default.fileExists(atPath: dylibPath) else {
             ActivityLogger.shared.log("launch.new fallback=open without dylib")
             return RStudioDiscovery.launchNewInstance()
         }
 
         beginLaunchGracePeriod()
-        startLaunchHideWatch()
-        // Blank "New R" must not inherit a previous project name.
         RStudioWindowService.pendingProjectPath = nil
 
-        if launchViaDirectBinary(dylibPath: dylibPath, projectPath: nil) {
-            ActivityLogger.shared.log("launch.new dylib=true mode=directBinary")
+        if launchViaDirectBinary(dylibPath: dylibPath, projectPath: nil, activateWhenReady: activateWhenReady) {
+            ActivityLogger.shared.log("launch.new dylib=true mode=directBinary activate=\(activateWhenReady)")
             return true
         }
 
         let appURL = URL(fileURLWithPath: RStudioDiscovery.appPath)
         let config = NSWorkspace.OpenConfiguration()
         config.createsNewApplicationInstance = true
-        config.activates = false
+        config.activates = activateWhenReady
         config.environment = ["DYLD_INSERT_LIBRARIES": dylibPath]
 
         NSWorkspace.shared.openApplication(at: appURL, configuration: config) { app, error in
             if let error {
                 ActivityLogger.shared.log("launch.new workspaceFailed error=\(error.localizedDescription)")
-                _ = launchNewViaOpenHidden(dylibPath: dylibPath)
+                _ = launchNewViaOpenHidden(dylibPath: dylibPath, activateWhenReady: activateWhenReady)
                 return
             }
             if let app {
-                onNewInstanceLaunched(pid: app.processIdentifier)
+                onNewInstanceLaunched(pid: app.processIdentifier, activate: activateWhenReady)
             }
-            ActivityLogger.shared.log("launch.new dylib=true activates=false")
+            ActivityLogger.shared.log("launch.new dylib=true activates=\(activateWhenReady)")
         }
         return true
     }
@@ -136,7 +141,7 @@ enum DockPolicyService {
             RStudioDiscovery.quit(pid: pid)
             RStudioWindowService.removeCachedInstance(pid: pid)
             DockPolicyService.noteProcessTerminated(pid: pid)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                 _ = openProjectInNewWindow(at: path)
             }
             return true
@@ -159,10 +164,9 @@ enum DockPolicyService {
         }
 
         beginLaunchGracePeriod()
-        startLaunchHideWatch()
         RStudioWindowService.pendingProjectPath = path
 
-        if launchViaDirectBinary(dylibPath: dylibPath, projectPath: path) {
+        if launchViaDirectBinary(dylibPath: dylibPath, projectPath: path, activateWhenReady: true) {
             ActivityLogger.shared.log("launch.project dylib=true mode=directBinary path=\(path)")
             return true
         }
@@ -171,7 +175,7 @@ enum DockPolicyService {
         let fileURL = URL(fileURLWithPath: path)
         let config = NSWorkspace.OpenConfiguration()
         config.createsNewApplicationInstance = true
-        config.activates = false
+        config.activates = true
         config.environment = ["DYLD_INSERT_LIBRARIES": dylibPath]
 
         NSWorkspace.shared.open([fileURL], withApplicationAt: appURL, configuration: config) { app, error in
@@ -181,22 +185,25 @@ enum DockPolicyService {
                 return
             }
             if let app {
-                onNewInstanceLaunched(pid: app.processIdentifier)
+                onNewInstanceLaunched(pid: app.processIdentifier, activate: true)
             }
-            ActivityLogger.shared.log("launch.project dylib=true activates=false path=\(path)")
+            ActivityLogger.shared.log("launch.project dylib=true activates=true path=\(path)")
         }
         return true
     }
 
     /// Launch RStudio Mach-O directly so DockHide.dylib loads before NSApp starts.
-    private static func launchViaDirectBinary(dylibPath: String, projectPath: String?) -> Bool {
+    private static func launchViaDirectBinary(
+        dylibPath: String,
+        projectPath: String?,
+        activateWhenReady: Bool
+    ) -> Bool {
         let binary = (RStudioDiscovery.appPath as NSString)
             .appendingPathComponent("Contents/MacOS/RStudio")
         guard FileManager.default.isExecutableFile(atPath: binary) else {
             return false
         }
 
-        let before = Set(RStudioDiscovery.runningApplications().map(\.processIdentifier))
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
         if let projectPath {
@@ -204,22 +211,15 @@ enum DockPolicyService {
         }
         var environment = ProcessInfo.processInfo.environment
         environment["DYLD_INSERT_LIBRARIES"] = dylibPath
-        // Keep LaunchServices from forcing a foreground activation.
-        environment["__CFPREFERENCES_APPLICATION_IDENTIFIER"] = environment["__CFPREFERENCES_APPLICATION_IDENTIFIER"] ?? ""
         process.environment = environment
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                hideNewestRStudio(excluding: before)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                hideNewestRStudio(excluding: before)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                hideNewestRStudio(excluding: before)
+            let pid = process.processIdentifier
+            DispatchQueue.main.async {
+                onNewInstanceLaunched(pid: pid, activate: activateWhenReady)
             }
             return true
         } catch {
@@ -228,51 +228,36 @@ enum DockPolicyService {
         }
     }
 
-    private static func hideNewestRStudio(excluding before: Set<pid_t>) {
-        let apps = RStudioDiscovery.runningApplications()
-        let newcomers = apps.filter { !before.contains($0.processIdentifier) }
-        let target = newcomers.max(by: { $0.processIdentifier < $1.processIdentifier })
-            ?? apps.max(by: { $0.processIdentifier < $1.processIdentifier })
-        guard let target else { return }
-        onNewInstanceLaunched(pid: target.processIdentifier)
-    }
-
-    private static var launchHideWatchGeneration = 0
-
-    /// Rapidly hide any new RStudio Dock tiles during the first second after launch.
-    private static func startLaunchHideWatch() {
-        launchHideWatchGeneration += 1
-        let generation = launchHideWatchGeneration
-        let before = Set(RStudioDiscovery.runningApplications().map(\.processIdentifier))
-
-        for step in 0..<20 {
-            let delay = 0.05 * Double(step)
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                guard generation == launchHideWatchGeneration else { return }
-                for app in RStudioDiscovery.runningApplications()
-                where !before.contains(app.processIdentifier) || step == 0 {
-                    hideInstanceFromDock(pid: app.processIdentifier)
+    private static func watchForNewInstance(excluding before: Set<pid_t>, activate: Bool) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            for attempt in 0..<40 {
+                if attempt > 0 {
+                    Thread.sleep(forTimeInterval: 0.05)
                 }
+                let newcomers = RStudioDiscovery.runningApplications()
+                    .filter { !before.contains($0.processIdentifier) }
+                guard let target = newcomers.max(by: { $0.processIdentifier < $1.processIdentifier }) else {
+                    continue
+                }
+                DispatchQueue.main.async {
+                    onNewInstanceLaunched(pid: target.processIdentifier, activate: activate)
+                }
+                return
             }
         }
     }
 
-    private static func launchNewViaOpenHidden(dylibPath: String) -> Bool {
+    private static func launchNewViaOpenHidden(dylibPath: String, activateWhenReady: Bool) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        // -g background, -j hidden — reduce Dock flash on launch.
         process.arguments = ["-n", "-g", "-j", "-a", RStudioDiscovery.appPath]
         var environment = ProcessInfo.processInfo.environment
         environment["DYLD_INSERT_LIBRARIES"] = dylibPath
         process.environment = environment
         do {
             try process.run()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                if let app = newestRunningRStudio() {
-                    onNewInstanceLaunched(pid: app.processIdentifier)
-                    reinforceHideSoon(pid: app.processIdentifier)
-                }
-            }
+            let before = Set(RStudioDiscovery.runningApplications().map(\.processIdentifier))
+            watchForNewInstance(excluding: before, activate: activateWhenReady)
             return true
         } catch {
             ActivityLogger.shared.log("launch.new openFailed error=\(error.localizedDescription)")
@@ -289,24 +274,12 @@ enum DockPolicyService {
         process.environment = environment
         do {
             try process.run()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                if let app = newestRunningRStudio() {
-                    onNewInstanceLaunched(pid: app.processIdentifier)
-                    reinforceHideSoon(pid: app.processIdentifier)
-                }
-            }
+            let before = Set(RStudioDiscovery.runningApplications().map(\.processIdentifier))
+            watchForNewInstance(excluding: before, activate: true)
             return true
         } catch {
             ActivityLogger.shared.log("launch.project openFailed path=\(path) error=\(error.localizedDescription)")
             return false
-        }
-    }
-
-    private static func reinforceHideSoon(pid: pid_t) {
-        for delay in [0.0, 0.03, 0.08, 0.15, 0.3, 0.6] as [TimeInterval] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                hideInstanceFromDock(pid: pid)
-            }
         }
     }
 
@@ -320,7 +293,6 @@ enum DockPolicyService {
     private static let focusPIDPath = "/tmp/com.zhangjing.RStudioHub.focusPID"
 
     /// Fallback only: briefly allow Regular policy inside the target process (via dylib).
-    /// Do not call TransformProcessType/showInDock — that flashes Dock and menu bar.
     static func promoteTargetForFocus(pid: pid_t) {
         writeFocusPID(pid)
         postDarwinNotification(allowActivateNotification)
@@ -364,14 +336,12 @@ enum DockPolicyService {
 
     /// Accessory policy hides Dock only; menu bar stays when RStudio is frontmost.
     private static func hideInstanceFromDock(pid: pid_t) {
-        if !isDylibInjected(pid: pid) {
-            hideViaLldb(pid: pid)
+        if isDylibInjected(pid: pid) {
+            postDarwinNotification(hideDockNotification)
+            return
         }
+        hideViaLldb(pid: pid)
         postDarwinNotification(hideDockNotification)
-    }
-
-    private static func newestRunningRStudio() -> NSRunningApplication? {
-        RStudioDiscovery.runningApplications().max(by: { $0.processIdentifier < $1.processIdentifier })
     }
 
     private static func hideLegacyInstancesOnly() {
@@ -388,6 +358,7 @@ enum DockPolicyService {
         let pruned = dylibInjectedPIDs().intersection(running)
         UserDefaults.standard.set(Array(pruned), forKey: dylibPIDDefaultsKey)
         lldbHiddenPIDs = lldbHiddenPIDs.intersection(running)
+        trackedNewInstancePIDs = trackedNewInstancePIDs.intersection(Set(running.map { pid_t($0) }))
     }
 
     private static func dylibInjectedPIDs() -> Set<Int> {

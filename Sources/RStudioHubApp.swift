@@ -22,6 +22,9 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastDockFileTooltipPath: String?
     private var pendingDockLaunchFocus = false
 
+    var isHubMenuVisible: Bool { menuIsOpen || menuTrackingActive }
+    var isDockHoverMenuSuppressed: Bool { isRecordingShortcut }
+
     func showMenuAfterShortcutRecording() {
         showMenu()
     }
@@ -34,7 +37,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         popupMenu.delegate = self
         dockMenu.delegate = self
         popupMenu.appearance = NSAppearance(named: .aqua)
-        dockMenu.appearance = NSAppearance(named: .aqua)
+        dockMenu.autoenablesItems = true
         RStudioWindowService.restoreFocusedPID()
         LaunchAtLoginSettings.syncOnLaunch()
         setupWorkspaceObservers()
@@ -95,7 +98,7 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let instances = RStudioWindowService.instancesFast()
         if instances.isEmpty {
             ActivityLogger.shared.log("hub.dockClick.launchNew")
-            if !DockPolicyService.launchNewInstanceHiddenFromDock() {
+            if !DockPolicyService.launchNewInstanceHiddenFromDock(activateWhenReady: true) {
                 showLaunchError(message: "请确认 RStudio 已安装在 /Applications/RStudio.app")
             }
             return
@@ -347,9 +350,11 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 DockPolicyService.handleRStudioLaunch(pid: app.processIdentifier)
                 self?.refreshMenuForProcessChange()
                 RStudioWindowService.warmTitlesInBackground()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                    if !DockPolicyService.isDylibInjected(pid: app.processIdentifier) {
-                        DockPolicyService.onExternalInstanceLaunched(pid: app.processIdentifier)
+                let pid = app.processIdentifier
+                let delay: TimeInterval = DockPolicyService.isDylibInjected(pid: pid) ? 0.4 : 1.0
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    if !DockPolicyService.isDylibInjected(pid: pid) {
+                        DockPolicyService.onExternalInstanceLaunched(pid: pid)
                     }
                     self?.reloadMenuInstances()
                     RStudioWindowService.warmTitlesInBackground()
@@ -715,12 +720,11 @@ final class RStudioHubApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func launchNewRStudio() {
-        if DockPolicyService.launchNewInstanceHiddenFromDock() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+        openMenu?.cancelTracking()
+        if DockPolicyService.launchNewInstanceHiddenFromDock(activateWhenReady: true) {
+            refreshMenuForProcessChange()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
                 self?.refreshMenuForProcessChange()
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                self?.reloadMenuInstances()
             }
         } else {
             showLaunchError(message: "请确认 RStudio 已安装在 /Applications/RStudio.app")
